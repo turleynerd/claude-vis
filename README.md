@@ -25,13 +25,15 @@ claude-vis --tree                # start in tree view
 claude-vis --past                # start in the past-sessions view
 claude-vis --sort cost           # order past sessions by cost instead of date
 claude-vis --sort project        # group past sessions by project directory
+claude-vis --theme cats          # sprite theme: people, bots, cats, owls
 claude-vis --once                # print one frame and exit (no TUI)
 ```
 
 Keys: `t` toggles grid/tree, `p` toggles the past-sessions view, `s` cycles
-past ordering (date / cost / project), `q` quits. The tree and past views
-scroll with `j`/`k`, the arrow keys, or the mouse wheel — `ctrl-d`/`ctrl-u`
-and PgDn/PgUp jump half a page, `g`/`G` jump to top/bottom.
+past ordering (date / cost / project), `c` cycles the sprite theme, `q`
+quits. The tree and past views scroll with `j`/`k`, the arrow keys, or the
+mouse wheel — `ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a page, `g`/`G` jump
+to top/bottom.
 
 ## Tree view
 
@@ -88,6 +90,18 @@ are in effect.
 | `(^o^) "..."` | TALK     | streaming a text response                     |
 | `(-_-) zZz`   | IDLE     | no transcript activity for 20s                |
 | `(x_x)`       | DONE     | agent finished — sprite poofs away            |
+
+## Themes
+
+Not a people person? `--theme` (or `c` at runtime) re-skins every sprite —
+the animations, props, and *poof* stay the same:
+
+| Theme    | Working   | Editing     | Happy     | Done      |
+| -------- | --------- | ----------- | --------- | --------- |
+| `people` | `(o_o)`   | `(>_<)/[=]` | `(^o^)`   | `(x_x)`   |
+| `bots`   | `[o_o]`   | `[>_<]/[=]` | `[^o^]`   | `[x_x]`   |
+| `cats`   | `(=o.o=)` | `(=>.<=)/[=]` | `(=^o^=)` | `(=x.x=)` |
+| `owls`   | `{o,o}`   | `{>,<}/[=]` | `{^,^}`   | `{x,x}`   |
 
 ## How it works
 

@@ -38,6 +38,8 @@ options:
   --past             start in the past-sessions view
   --sort <key>       order past sessions by "date" (default), "cost", or
                      "project" (grouped by directory)
+  --theme <name>     sprite theme: people (o_o), bots [o_o], cats (=^.^=),
+                     owls {o,o}
   --once             render a single frame to stdout and exit (no TUI)
   -v, --version      print version
   -h, --help         show this help
@@ -46,6 +48,7 @@ keys:
   t                  toggle sprite grid / relationship tree
   p                  toggle the past-sessions view
   s                  cycle past-session order: date / cost / project
+  c                  cycle sprite theme: people / bots / cats / owls
   j/k, arrows, wheel scroll the tree and past views
   ctrl-d/u, PgDn/Up  scroll half a page; g jumps to top, G to bottom
   q                  quit`);
@@ -132,6 +135,44 @@ const ANIM = {
     ['', ''],
   ],
 };
+
+// ---------- sprite themes ----------
+// A theme re-skins the critter by swapping face tokens inside the base
+// animation frames; props, thought bubbles, and the *poof* stay intact.
+// All faces are plain ASCII so column alignment never drifts.
+const THEMES = {
+  people: null, // the base frames above
+  bots: {
+    '(o_o)': '[o_o]', '(o_O)': '[o_O]', '(O_O)': '[O_O]', '(-_-)': '[-_-]',
+    '(>_<)': '[>_<]', '(^o^)': '[^o^]', '(^_^)': '[^_^]', '(x_x)': '[x_x]',
+  },
+  cats: {
+    '(o_o)': '(=o.o=)', '(o_O)': '(=o.O=)', '(O_O)': '(=O.O=)', '(-_-)': '(=-.-=)',
+    '(>_<)': '(=>.<=)', '(^o^)': '(=^o^=)', '(^_^)': '(=^.^=)', '(x_x)': '(=x.x=)',
+  },
+  owls: {
+    '(o_o)': '{o,o}', '(o_O)': '{o,O}', '(O_O)': '{O,O}', '(-_-)': '{-,-}',
+    '(>_<)': '{>,<}', '(^o^)': '{^,^}', '(^_^)': '{^,^}', '(x_x)': '{x,x}',
+  },
+};
+const THEME_NAMES = Object.keys(THEMES);
+let theme = THEME_NAMES.includes(argVal('--theme', 'people')) ? argVal('--theme', 'people') : 'people';
+
+function themedFace(face) {
+  return (THEMES[theme] && THEMES[theme][face]) || face;
+}
+
+function themedAnim(name) {
+  const map = THEMES[name];
+  if (!map) return ANIM;
+  const sub = (s) => Object.entries(map).reduce((acc, [k, v]) => acc.split(k).join(v), s);
+  const out = {};
+  for (const [state, frames] of Object.entries(ANIM)) {
+    out[state] = frames.map(([bubble, body]) => [sub(bubble), sub(body)]);
+  }
+  return out;
+}
+let anim = themedAnim(theme);
 
 // state -> [label, ansi fg color]
 const STYLE = {
@@ -876,14 +917,14 @@ function currentFrame(a, now) {
   let idx;
   if (a.dyingAt) {
     key = 'dying';
-    frames = ANIM.dying;
+    frames = anim.dying;
     idx = Math.min(frames.length - 1, Math.floor((now - a.dyingAt) / 260));
   } else if (!a.preexisting && now - a.born < 1200) {
     key = 'spawn';
-    frames = ANIM.spawn;
+    frames = anim.spawn;
     idx = Math.min(frames.length - 1, Math.floor((now - a.born) / 300));
   } else {
-    frames = ANIM[key] || ANIM.thinking;
+    frames = anim[key] || anim.thinking;
     idx = Math.floor((tick + a.phase) / 3) % frames.length;
   }
   return { key, frame: frames[idx] };
@@ -921,14 +962,14 @@ function treeRow(a, prefix, now, cols, totals) {
   const name = padEnd(a.name, isMain ? 25 : 27 - prefix.length);
   const sprite = padEnd(`${frame[1]}${frame[0] ? '  ' + frame[0] : ''}`, 18);
   const elapsed = mmss(now - a.stateSince);
-  const detail = padEnd(a.dyingAt ? '*poof*' : a.detail, Math.max(10, cols - 93));
+  const detail = padEnd(a.dyingAt ? '*poof*' : a.detail, Math.max(10, cols - 94));
   const stats = (totals
     ? `Σ ${fmtCost(totals.cost)} ${fmtTok(totals.tok)}`
     : `${fmtCost(a.cost)} ${fmtTok(a.tok)}`).padStart(13);
   const proj = trunc(a.project || a.projectDir, 14);
   return ' ' + color('90', prefix) +
     color(isMain ? '1;97' : '37', name) + ' ' +
-    color(`1;${fg}`, sprite) +
+    color(`1;${fg}`, sprite) + ' ' +
     color(`1;${fg}`, padEnd(label, 9)) + ' ' +
     color('37', detail) + ' ' +
     color('33', stats) + ' ' +
@@ -938,17 +979,17 @@ function treeRow(a, prefix, now, cols, totals) {
 function pastRow(t, prefix, now, cols, totals) {
   const isMain = t.kind === 'main';
   const name = padEnd(t.name, isMain ? 25 : 27 - prefix.length);
-  const sprite = padEnd('(x_x)', 18);
+  const sprite = padEnd(themedFace('(x_x)'), 18);
   const detail = padEnd(
     !t.scanned ? 'tallying…' : isMain ? `ended ${agoStr(now - t.mtimeMs)}` : '',
-    Math.max(10, cols - 93));
+    Math.max(10, cols - 94));
   const stats = (totals
     ? `Σ ${fmtCost(totals.cost)} ${fmtTok(totals.tok)}`
     : `${fmtCost(t.cost)} ${fmtTok(t.tok)}`).padStart(13);
   const proj = trunc(t.project || (t.projectDir ? projectFromDirName(t.projectDir) : ''), 14);
   return ' ' + color('90', prefix) +
     color(isMain ? '37' : '90', name) + ' ' +
-    color('90', sprite) +
+    color('90', sprite) + ' ' +
     color('90', padEnd('ENDED', 9)) + ' ' +
     color('90', detail) + ' ' +
     color('33', stats) + ' ' +
@@ -1114,8 +1155,8 @@ function buildScreen() {
   while (lines.length < rows - 1) lines.push('');
   lines.length = rows - 1;
   lines.push(color('90', viewMode === 'past'
-    ? ` q quit · p back to live · s sort (${pastSort}) · j/k scroll · ${pricesSource} prices`
-    : ` q quit · t grid/tree · p past · j/k scroll · ${pricesSource} prices · sprites *poof* when agents finish`));
+    ? ` q quit · p back to live · s sort (${pastSort}) · c theme (${theme}) · j/k scroll · ${pricesSource} prices`
+    : ` q quit · t grid/tree · p past · c theme (${theme}) · j/k scroll · ${pricesSource} prices · *poof* = done`));
   return lines;
 }
 
@@ -1146,6 +1187,11 @@ function handleKey(k) {
   if (k === 's') {
     pastSort = pastSort === 'date' ? 'cost' : pastSort === 'cost' ? 'project' : 'date';
     scrollY = 0;
+    draw();
+  }
+  if (k === 'c') {
+    theme = THEME_NAMES[(THEME_NAMES.indexOf(theme) + 1) % THEME_NAMES.length];
+    anim = themedAnim(theme);
     draw();
   }
   // scrolling: vim keys, arrows, page keys, mouse wheel (SGR buttons 64/65)
