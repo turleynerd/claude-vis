@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            bun build index.js --compile --target="bun-$t" --outfile "dist/$t/claude-vis"
+            tar -czf "dist/claude-vis-$t.tar.gz" -C "dist/$t" claude-vis
+          done
+          (cd dist && shasum -a 256 ./*.tar.gz > checksums.txt)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt \
+            --title "claude-vis $GITHUB_REF_NAME" --generate-notes

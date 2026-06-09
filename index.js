@@ -1,0 +1,947 @@
+#!/usr/bin/env node
+// claude-vis — watch your Claude Code agents come to life in the terminal.
+//
+// Tails the session transcripts Claude Code writes to ~/.claude/projects/
+// and renders a little animated sprite for every live agent: the main
+// session plus each subagent it spawns. No config needed in the session
+// being watched.
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const https = require('https');
+const { execFile } = require('child_process');
+
+const PROJECTS_DIR = process.env.CLAUDE_VIS_PROJECTS_DIR
+  || path.join(os.homedir(), '.claude', 'projects');
+
+// ---------- cli args ----------
+const args = process.argv.slice(2);
+function argVal(flag, dflt) {
+  const i = args.indexOf(flag);
+  return i >= 0 && args[i + 1] != null ? args[i + 1] : dflt;
+}
+if (args.includes('--version') || args.includes('-v')) {
+  console.log(`claude-vis ${require('./package.json').version}`);
+  process.exit(0);
+}
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`claude-vis — animated sprites for your running Claude Code agents
+
+usage: claude-vis [options]
+
+options:
+  --project <name>   only show sessions whose project path contains <name>
+  --window <mins>    treat sessions modified in the last N minutes as live (default 5)
+  --tree             start in tree view (press t to toggle at runtime)
+  --once             render a single frame to stdout and exit (no TUI)
+  -v, --version      print version
+  -h, --help         show this help
+
+keys:
+  t                  toggle sprite grid / relationship tree
+  q                  quit`);
+  process.exit(0);
+}
+const FILTER = argVal('--project', null);
+const ACTIVE_WINDOW_MS = parseFloat(argVal('--window', '5')) * 60_000;
+const ONCE = args.includes('--once');
+let viewMode = args.includes('--tree') ? 'tree' : 'grid';
+
+const TICK_MS = 120;          // render tick
+const IDLE_AFTER_MS = 20_000; // no transcript lines for this long -> zzz
+const SUB_DONE_AFTER_MS = 90_000;    // quiet subagent file -> done, despawn
+const MAIN_GONE_AFTER_MS = 10 * 60_000; // quiet main session -> despawn
+const DEATH_MS = 1300;        // length of the *poof* animation
+
+// ---------- sprite animation frames: [thought-bubble line, body line] ----------
+const ANIM = {
+  spawn: [
+    ['', '.'],
+    ['', '*'],
+    ['*  .  *', '(o_o)'],
+    ['.  *  .', '\\(o_o)/'],
+  ],
+  thinking: [
+    ['.', '(o_o)'],
+    ['.o', '(o_o)'],
+    ['.oO', '(o_O)'],
+    ['.oO ( ? )', '(o_O)'],
+    ['.oO ( ! )', '(O_O)'],
+    ['', '(-_-)'],
+  ],
+  reading: [
+    ['', '(o_o) [#]'],
+    ['', '(o_-) [#]'],
+    ['', '(-_o) [#]'],
+    ['*flip*', '(o_o) [#]'],
+  ],
+  editing: [
+    ['*tik*', '(>_<)/[=]'],
+    ['', '(>_<)|[=]'],
+    ['*tak*', '(>_<)\\[=]'],
+    ['', '(>_<)|[=]'],
+  ],
+  running: [
+    ['$ |', '(o_o)>_'],
+    ['$ /', '(o_o)>_'],
+    ['$ -', '(o_o)>_'],
+    ['$ \\', '(o_o)>_'],
+  ],
+  spawning: [
+    ['*', '(o_o)/'],
+    ['+ *', '(o_o)/'],
+    ['* + *', '\\(o_o)/'],
+    ['+ * +', '(o_o)/'],
+  ],
+  talking: [
+    ['" ... "', '(^o^)'],
+    ['" o.. "', '(^o^)'],
+    ['" oo. "', '(^_^)'],
+    ['" ooo "', '(^o^)'],
+  ],
+  prompted: [
+    ['!', '(O_O)'],
+    ['! !', '(O_O)'],
+  ],
+  idle: [
+    ['', '(-_-)'],
+    ['z', '(-_-)'],
+    ['zZ', '(-_-)'],
+    ['zZz', '(-_-)'],
+    ['zZz', '(-_-)'],
+    ['', '(-_-)'],
+  ],
+  dying: [
+    ['', '(x_x)'],
+    ['', '(x_x)'],
+    ['*poof*', '. : .'],
+    ['', '.'],
+    ['', ''],
+  ],
+};
+
+// state -> [label, ansi fg color]
+const STYLE = {
+  spawn: ['SPAWN', '97'],
+  thinking: ['THINK', '95'],
+  reading: ['READ', '96'],
+  editing: ['EDIT', '93'],
+  running: ['RUN', '92'],
+  spawning: ['DELEGATE', '36'],
+  talking: ['TALK', '94'],
+  prompted: ['PROMPT', '91'],
+  idle: ['IDLE', '90'],
+  dying: ['DONE', '90'],
+};
+
+const CARD_W = 36; // total card width including borders
+
+// ---------- transcript parsing ----------
+function toolDetail(input) {
+  if (!input || typeof input !== 'object') return '';
+  if (input.file_path) return path.basename(String(input.file_path));
+  if (input.path) return path.basename(String(input.path));
+  if (input.description) return String(input.description);
+  if (input.pattern) return String(input.pattern);
+  if (input.command) return String(input.command);
+  if (input.url) return String(input.url).replace(/^https?:\/\//, '');
+  if (input.query) return String(input.query);
+  if (input.subagent_type) return String(input.subagent_type);
+  if (input.prompt) return String(input.prompt);
+  return '';
+}
+
+function toolState(name) {
+  const n = String(name).toLowerCase();
+  if (/^(edit|write|multiedit|notebookedit)$/.test(n)) return 'editing';
+  if (/^(bash|bashoutput|killshell)$/.test(n)) return 'running';
+  if (/^(task|agent)$/.test(n)) return 'spawning';
+  if (/^(read|grep|glob|ls|websearch|webfetch|toolsearch)$/.test(n)) return 'reading';
+  return 'running';
+}
+
+function squish(s, n) {
+  s = String(s).replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+// ---------- token & cost tallies ----------
+// Static fallback: $/MTok by model family (cache read = 0.1x input; cache
+// write 1.25x for 5m TTL, 2x for 1h). Older/legacy models are approximated
+// by family. Overridden by live per-model prices fetched at launch.
+const PRICING = [
+  [/fable/, 10, 50],
+  [/opus/, 5, 25],
+  [/sonnet/, 3, 15],
+  [/haiku/, 1, 5],
+];
+
+// Live per-model rates ($/token) from LiteLLM's community pricing data —
+// there is no official Anthropic pricing API.
+const PRICES_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
+const livePrices = new Map();
+let pricesSource = 'static';
+
+function rateFor(model) {
+  const r = livePrices.get(model)
+    || livePrices.get(model.replace(/-\d{8}$/, '')); // dated id -> alias
+  if (r) return r;
+  const [, inP, outP] = PRICING.find(([re]) => re.test(model)) || [null, 5, 25];
+  return {
+    in: inP / 1e6,
+    out: outP / 1e6,
+    read: inP * 0.1 / 1e6,
+    w5: inP * 1.25 / 1e6,
+    w1: inP * 2 / 1e6,
+  };
+}
+
+function priceEntry(e) {
+  const p = rateFor(e.m);
+  return e.i * p.in + e.o * p.out + e.r * p.read + e.w5 * p.w5 + e.w1 * p.w1;
+}
+
+function usageEntry(u, model) {
+  const cc = u.cache_creation;
+  const e = {
+    m: model,
+    i: u.input_tokens || 0,
+    o: u.output_tokens || 0,
+    r: u.cache_read_input_tokens || 0,
+    w5: cc ? (cc.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0),
+    w1: cc ? (cc.ephemeral_1h_input_tokens || 0) : 0,
+  };
+  e.tok = e.i + e.o + e.r + e.w5 + e.w1;
+  e.cost = priceEntry(e);
+  return e;
+}
+
+function fetchJson(url, timeoutMs, redirects = 3) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'user-agent': 'claude-vis' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+        res.resume();
+        return fetchJson(res.headers.location, timeoutMs, redirects - 1).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`http ${res.statusCode}`)); }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (err) { reject(err); }
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+async function loadLivePrices() {
+  let data;
+  try {
+    data = await fetchJson(PRICES_URL, 10_000);
+  } catch {
+    return; // offline or fetch failed — the static table stays in effect
+  }
+  for (const [key, v] of Object.entries(data)) {
+    if (!v || v.litellm_provider !== 'anthropic') continue;
+    if (typeof v.input_cost_per_token !== 'number') continue;
+    const id = key.replace(/^anthropic\//, '');
+    if (!id.startsWith('claude')) continue;
+    livePrices.set(id, {
+      in: v.input_cost_per_token,
+      out: v.output_cost_per_token || 0,
+      read: v.cache_read_input_token_cost ?? v.input_cost_per_token * 0.1,
+      w5: v.cache_creation_input_token_cost ?? v.input_cost_per_token * 1.25,
+      w1: v.cache_creation_input_token_cost_above_1hr ?? v.input_cost_per_token * 2,
+    });
+  }
+  if (livePrices.size === 0) return;
+  pricesSource = 'live';
+  // reprice everything tallied before the fetch finished
+  for (const t of [...agents.values(), ...retainedUsage.values()]) {
+    t.tok = 0;
+    t.cost = 0;
+    for (const e of t.usageByReq.values()) {
+      e.cost = priceEntry(e);
+      t.tok += e.tok;
+      t.cost += e.cost;
+    }
+  }
+}
+
+// Transcripts repeat the same usage on every line of a streamed message, so
+// tallies are keyed by requestId — later lines overwrite, never double-count.
+function addUsage(agent, obj) {
+  const u = obj.message && obj.message.usage;
+  const key = obj.requestId || (obj.message && obj.message.id);
+  if (!u || !key) return;
+  const entry = usageEntry(u, obj.message.model || '');
+  const prev = agent.usageByReq.get(key);
+  if (prev) { agent.tok -= prev.tok; agent.cost -= prev.cost; }
+  agent.usageByReq.set(key, entry);
+  agent.tok += entry.tok;
+  agent.cost += entry.cost;
+  if (agent.usageByReq.size > 4000) {
+    let drop = 1000;
+    for (const k of agent.usageByReq.keys()) {
+      agent.usageByReq.delete(k);
+      if (--drop === 0) break;
+    }
+  }
+}
+
+function fmtTok(n) {
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n / 1000).toFixed(1) + 'k';
+  return (n / 1e6).toFixed(2) + 'm';
+}
+function fmtCost(c) {
+  return c >= 100 ? '$' + Math.round(c) : c >= 10 ? '$' + c.toFixed(1) : '$' + c.toFixed(2);
+}
+
+// ---------- event ticker ----------
+const ticker = [];
+function logEvent(agent, state, detail) {
+  ticker.push({ t: Date.now(), agent, state, detail: detail || '' });
+  if (ticker.length > 200) ticker.splice(0, 100);
+}
+
+function setState(agent, state, detail) {
+  if (agent.state !== state || agent.detail !== detail) {
+    agent.state = state;
+    agent.detail = detail || '';
+    agent.stateSince = Date.now();
+    if (!agent.priming && state !== 'idle') logEvent(agent, state, detail);
+  }
+}
+
+function applyLine(agent, obj) {
+  if (!obj || typeof obj !== 'object') return;
+  // metadata that names the sprite
+  if (agent.kind === 'main' && obj.slug) agent.name = obj.slug;
+  if (obj.attributionAgent) agent.name = obj.attributionAgent;
+  if (obj.cwd) {
+    agent.cwd = obj.cwd;
+    if (!agent.project) agent.project = path.basename(obj.cwd);
+  }
+  addUsage(agent, obj);
+  // legacy inline sidechains live in the main file; modern subagents have
+  // their own files, so skip sidechain lines when tailing a main session
+  if (agent.kind === 'main' && obj.isSidechain) return;
+
+  if (obj.type === 'assistant') {
+    const blocks = (obj.message && obj.message.content) || [];
+    if (!Array.isArray(blocks)) return;
+    for (const b of blocks) {
+      if (!b || typeof b !== 'object') continue;
+      if (b.type === 'thinking') setState(agent, 'thinking', '');
+      else if (b.type === 'text') setState(agent, 'talking', squish(b.text || '', 60));
+      else if (b.type === 'tool_use') {
+        setState(agent, toolState(b.name), squish(`${b.name} ${toolDetail(b.input)}`, 60));
+      }
+    }
+  } else if (obj.type === 'user') {
+    const c = obj.message && obj.message.content;
+    if (Array.isArray(c) && c.some((b) => b && b.type === 'tool_result')) {
+      setState(agent, 'thinking', 'reading results');
+    } else if (typeof c === 'string' || Array.isArray(c)) {
+      setState(agent, 'prompted', 'new instructions');
+    }
+  }
+}
+
+// ---------- agent registry ----------
+const agents = new Map(); // file path -> agent
+let bornCounter = 0;
+const startTime = Date.now();
+
+function hashPhase(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h) % 7;
+}
+
+function projectFromDirName(dirName) {
+  const parts = dirName.split('-').filter(Boolean);
+  return parts[parts.length - 1] || dirName;
+}
+
+// files whose sprite already poofed — their mtime sits inside the activity
+// window for a while, so scan() would resurrect them every ~2s otherwise.
+// Maps file -> mtime at death; only a write after that revives the agent.
+const deadFiles = new Map();
+
+function ensureAgent(meta) {
+  let a = agents.get(meta.file);
+  if (a) return a;
+  const st = safeStat(meta.file);
+  if (!st) return null;
+  const deadAt = deadFiles.get(meta.file);
+  if (deadAt != null) {
+    if (st.mtimeMs <= deadAt) return null; // still dead, stay poofed
+    deadFiles.delete(meta.file); // file grew — session came back for real
+  }
+  retainedUsage.delete(meta.file); // a live agent re-counts its own file
+  const preexisting = st.birthtimeMs < startTime - 3000;
+  a = {
+    file: meta.file,
+    kind: meta.kind,
+    sessionId: meta.sessionId,
+    name: meta.kind === 'main'
+      ? 'session'
+      : path.basename(meta.file, '.jsonl').replace(/^agent-(.{4}).*/, 'agent-$1'),
+    project: '',
+    cwd: '',
+    projectDir: projectFromDirName(meta.projectDir),
+    offset: 0,
+    buf: '',
+    state: 'idle',
+    detail: '',
+    stateSince: st.mtimeMs,
+    lastEventAt: st.mtimeMs,
+    mtimeMs: st.mtimeMs,
+    born: Date.now(),
+    bornOrder: bornCounter++,
+    preexisting,
+    dyingAt: 0,
+    probeSeen: 0,
+    probeMisses: 0,
+    phase: hashPhase(meta.file),
+    usageByReq: new Map(),
+    tok: 0,
+    cost: 0,
+  };
+  if (preexisting) {
+    a.priming = true;
+    primeFromTail(a, st.size);
+    a.priming = false;
+  } else {
+    logEvent(a, 'spawn', 'came to life');
+  }
+  agents.set(meta.file, a);
+  return a;
+}
+
+// Scan a whole transcript for token/cost tallies (only parsing lines that
+// carry usage). `target` needs {usageByReq, tok, cost}; metadata fields are
+// captured when present.
+function scanUsageInto(target, file, size) {
+  const CHUNK = 1 << 22; // 4MB
+  let pos = 0;
+  let rem = '';
+  while (pos < size) {
+    const want = Math.min(CHUNK, size - pos);
+    const chunk = readChunk(file, pos, want);
+    if (chunk == null) break;
+    pos += want;
+    const lines = (rem + chunk).split('\n');
+    rem = lines.pop();
+    for (const line of lines) {
+      if (!line.includes('"usage"')) continue;
+      try {
+        const obj = JSON.parse(line);
+        addUsage(target, obj);
+        if (target.kind === 'main' && obj.slug) target.name = obj.slug;
+        if (obj.attributionAgent) target.name = obj.attributionAgent;
+        if (obj.cwd) {
+          target.cwd = obj.cwd;
+          if (!target.project) target.project = path.basename(obj.cwd);
+        }
+      } catch { /* partial or non-json line */ }
+    }
+  }
+}
+
+// Usage retained from subagents that are no longer on screen — finished
+// before launch, or despawned after their *poof* — so session totals stay
+// complete. file -> {sessionId, usageByReq, tok, cost}
+const retainedUsage = new Map();
+
+function retainAgentUsage(a) {
+  retainedUsage.set(a.file, {
+    sessionId: a.sessionId,
+    usageByReq: a.usageByReq,
+    tok: a.tok,
+    cost: a.cost,
+  });
+}
+
+function sessionTotals(sessionId) {
+  let tok = 0;
+  let cost = 0;
+  for (const a of agents.values()) {
+    if (a.sessionId === sessionId) { tok += a.tok; cost += a.cost; }
+  }
+  for (const e of retainedUsage.values()) {
+    if (e.sessionId === sessionId) { tok += e.tok; cost += e.cost; }
+  }
+  return { tok, cost };
+}
+
+// For files that existed before we started: skip history for animation, but
+// scan the whole file for tallies and read a tail chunk to recover the
+// agent's name and current state.
+function primeFromTail(agent, size) {
+  agent.offset = size;
+  scanUsageInto(agent, agent.file, size);
+  const TAIL = 32 * 1024;
+  const start = Math.max(0, size - TAIL);
+  const chunk = readChunk(agent.file, start, size - start);
+  if (!chunk) return;
+  const lines = chunk.split('\n').filter((l) => l.trim());
+  // first line of the tail may be partial; drop it unless we read from 0
+  if (start > 0) lines.shift();
+  let lastValid = null;
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (agent.kind === 'main' && obj.slug) agent.name = obj.slug;
+      if (obj.attributionAgent) agent.name = obj.attributionAgent;
+      if (obj.cwd) {
+        agent.cwd = obj.cwd;
+        if (!agent.project) agent.project = path.basename(obj.cwd);
+      }
+      if (obj.type === 'user' || obj.type === 'assistant') lastValid = obj;
+    } catch { /* partial or non-json line */ }
+  }
+  if (lastValid) applyLine(agent, lastValid);
+  agent.stateSince = agent.mtimeMs;
+}
+
+function safeStat(f) {
+  try { return fs.statSync(f); } catch { return null; }
+}
+
+function readChunk(file, pos, len) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(len);
+    const n = fs.readSync(fd, buf, 0, len, pos);
+    return buf.slice(0, n).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// ---------- discovery ----------
+function matchesFilter(dirName) {
+  if (!FILTER) return true;
+  return dirName.toLowerCase().includes(FILTER.replace(/\//g, '-').toLowerCase());
+}
+
+function scan() {
+  const now = Date.now();
+  // dead entries older than the window can't be rediscovered anyway
+  for (const [f, t] of deadFiles) {
+    if (now - t > ACTIVE_WINDOW_MS) deadFiles.delete(f);
+  }
+  let projDirs;
+  try { projDirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true }); } catch { return; }
+  for (const pd of projDirs) {
+    if (!pd.isDirectory() || !matchesFilter(pd.name)) continue;
+    const projPath = path.join(PROJECTS_DIR, pd.name);
+    let entries;
+    try { entries = fs.readdirSync(projPath, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
+      const file = path.join(projPath, e.name);
+      const st = safeStat(file);
+      if (!st || now - st.mtimeMs > ACTIVE_WINDOW_MS) continue;
+      const sessionId = e.name.slice(0, -6);
+      ensureAgent({ file, kind: 'main', sessionId, projectDir: pd.name });
+      // subagents of an active session
+      const subDir = path.join(projPath, sessionId, 'subagents');
+      let subs;
+      try { subs = fs.readdirSync(subDir); } catch { continue; }
+      for (const s of subs) {
+        if (!s.endsWith('.jsonl')) continue;
+        const sf = path.join(subDir, s);
+        const sst = safeStat(sf);
+        if (!sst) continue;
+        // a subagent that's already gone quiet is finished — don't resurrect
+        // it, but tally its usage (however old) so session totals stay complete
+        if (!agents.has(sf) && now - sst.mtimeMs > SUB_DONE_AFTER_MS) {
+          if (!retainedUsage.has(sf)) {
+            const t = { usageByReq: new Map(), tok: 0, cost: 0 };
+            scanUsageInto(t, sf, sst.size);
+            retainedUsage.set(sf, { sessionId, usageByReq: t.usageByReq, tok: t.tok, cost: t.cost });
+          }
+          continue;
+        }
+        ensureAgent({ file: sf, kind: 'sub', sessionId, projectDir: pd.name });
+      }
+    }
+  }
+}
+
+// ---------- ingest ----------
+function ingest(agent) {
+  const st = safeStat(agent.file);
+  if (!st) return;
+  agent.mtimeMs = st.mtimeMs;
+  if (st.size < agent.offset) { agent.offset = 0; agent.buf = ''; } // truncated
+  if (st.size === agent.offset) return;
+  const len = Math.min(st.size - agent.offset, 1 << 20); // cap 1MB per tick
+  const chunk = readChunk(agent.file, agent.offset, len);
+  if (chunk == null) return;
+  agent.offset += Buffer.byteLength(chunk, 'utf8');
+  agent.buf += chunk;
+  const lines = agent.buf.split('\n');
+  agent.buf = lines.pop(); // keep trailing partial line
+  let sawEvent = false;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      applyLine(agent, JSON.parse(line));
+      sawEvent = true;
+    } catch { /* skip malformed line */ }
+  }
+  if (sawEvent) agent.lastEventAt = Date.now();
+}
+
+// ---------- session liveness (process probe) ----------
+// Closing Claude Code doesn't remove its transcript — it just stops growing —
+// so quiet-time alone can't tell "user stepped away" from "user quit". The
+// session's process can, though: it runs a claude binary, often advertises
+// its id in argv (--session-id / --resume), and keeps its cwd at the project
+// root. A main session missing from two consecutive probes is closed.
+const PROBE_TICKS = 42; // ~5s at TICK_MS
+const liveProbe = { at: 0, ids: new Set(), cwds: new Set() };
+let probing = false;
+
+function execOut(cmd, cmdArgs) {
+  return new Promise((resolve) => {
+    execFile(cmd, cmdArgs, { maxBuffer: 8 << 20 }, (err, out) => {
+      resolve(err && !out ? null : String(out));
+    });
+  });
+}
+
+async function probeProcesses() {
+  if (probing || (process.platform !== 'darwin' && process.platform !== 'linux')) return;
+  probing = true;
+  try {
+    const out = await execOut('ps', ['-axo', 'pid=,args=']);
+    if (out == null) return;
+    const ids = new Set();
+    const pids = [];
+    for (const line of out.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(\S+)(.*)$/);
+      if (!m) continue;
+      const [, pid, bin, rest] = m;
+      // claude *binaries* only — args mentioning claude (hooks etc.) don't count
+      if (!/claude/i.test(bin) || /claude-vis/.test(bin)) continue;
+      // helpers that exist without a user session
+      if (/--bg-(?:spare|pty-host)\b/.test(rest) || /^\s*daemon\s/.test(rest)) continue;
+      const sid = rest.match(/--(?:session-id|resume)[= ]+([0-9a-f][0-9a-f-]{35})/);
+      if (sid) ids.add(sid[1]);
+      pids.push(pid);
+    }
+    const cwds = new Set();
+    if (pids.length) {
+      if (process.platform === 'linux') {
+        for (const pid of pids) {
+          try { cwds.add(fs.readlinkSync(`/proc/${pid}/cwd`)); } catch { /* pid gone */ }
+        }
+      } else {
+        const lout = await execOut('lsof', ['-a', '-p', pids.join(','), '-d', 'cwd', '-Fn']);
+        if (lout == null) return; // can't trust an empty cwd set — skip this probe
+        for (const line of lout.split('\n')) {
+          if (line[0] === 'n') cwds.add(line.slice(1));
+        }
+      }
+    }
+    liveProbe.ids = ids;
+    liveProbe.cwds = cwds;
+    liveProbe.at = Date.now();
+  } finally {
+    probing = false;
+  }
+}
+
+// ---------- lifecycle ----------
+function lifecycle() {
+  const now = Date.now();
+  const liveSubSessions = new Set();
+  for (const a of agents.values()) {
+    if (a.kind === 'sub' && !a.dyingAt) liveSubSessions.add(a.sessionId);
+  }
+  // sessions whose claude process has vanished from the process table; the
+  // probe must postdate the agent (its cwd may not be parsed yet at birth)
+  const closedSessions = new Set();
+  for (const a of agents.values()) {
+    if (a.kind !== 'main') continue;
+    if (a.cwd && liveProbe.at > Math.max(a.born, a.probeSeen)) {
+      a.probeSeen = liveProbe.at;
+      const alive = liveProbe.ids.has(a.sessionId) || liveProbe.cwds.has(a.cwd);
+      a.probeMisses = alive ? 0 : a.probeMisses + 1;
+    }
+    if (a.probeMisses >= 2) closedSessions.add(a.sessionId);
+  }
+  for (const [file, a] of agents) {
+    const quiet = now - Math.max(a.mtimeMs, a.lastEventAt);
+    const gone = !safeStat(file);
+    const closed = closedSessions.has(a.sessionId);
+    const doneAfter = a.kind === 'sub' ? SUB_DONE_AFTER_MS : MAIN_GONE_AFTER_MS;
+    if ((gone || closed || quiet > doneAfter) && !a.dyingAt) {
+      a.dyingAt = now;
+      logEvent(a, 'dying', closed && !gone ? 'session closed — *poof*' : 'finished — *poof*');
+    }
+    if (a.dyingAt && now - a.dyingAt > DEATH_MS) {
+      if (a.kind === 'sub') retainAgentUsage(a);
+      const st = safeStat(file);
+      if (st) deadFiles.set(file, st.mtimeMs);
+      agents.delete(file);
+      continue;
+    }
+    if (!a.dyingAt && quiet > IDLE_AFTER_MS) {
+      // a quiet main session whose subagents are still working isn't asleep —
+      // it's waiting on its team
+      if (a.kind === 'main' && liveSubSessions.has(a.sessionId)) {
+        if (a.state !== 'spawning') setState(a, 'spawning', 'waiting on agents');
+      } else if (a.state === 'talking') {
+        // only the turn-boundary state falls asleep: a quiet file in an
+        // active state (thinking, running, editing…) usually means a long
+        // generation or slow tool call — lines are written only when blocks
+        // complete, so silence there doesn't mean idle
+        setState(a, 'idle', '');
+      }
+    }
+  }
+}
+
+// ---------- rendering ----------
+let tick = 0;
+const ESC = '\x1b';
+const color = (code, s) => `${ESC}[${code}m${s}${ESC}[0m`;
+
+function trunc(s, n) {
+  s = String(s);
+  return s.length > n ? s.slice(0, Math.max(0, n - 1)) + '…' : s;
+}
+function padEnd(s, n) { return trunc(s, n).padEnd(n); }
+function padCenter(s, n) {
+  s = trunc(s, n);
+  const left = Math.floor((n - s.length) / 2);
+  return ' '.repeat(left) + s + ' '.repeat(n - s.length - left);
+}
+function mmss(ms) {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+}
+
+function currentFrame(a, now) {
+  let key = a.state;
+  let frames;
+  let idx;
+  if (a.dyingAt) {
+    key = 'dying';
+    frames = ANIM.dying;
+    idx = Math.min(frames.length - 1, Math.floor((now - a.dyingAt) / 260));
+  } else if (!a.preexisting && now - a.born < 1200) {
+    key = 'spawn';
+    frames = ANIM.spawn;
+    idx = Math.min(frames.length - 1, Math.floor((now - a.born) / 300));
+  } else {
+    frames = ANIM[key] || ANIM.thinking;
+    idx = Math.floor((tick + a.phase) / 3) % frames.length;
+  }
+  return { key, frame: frames[idx] };
+}
+
+function card(a, now) {
+  const inner = CARD_W - 2;
+  const { key, frame } = currentFrame(a, now);
+  const [label, fg] = STYLE[key] || STYLE.thinking;
+  const icon = a.kind === 'main' ? '@' : '>';
+  const name = trunc(`${icon} ${a.name}`, inner - 6);
+  const top = `┌─ ${name} ${'─'.repeat(Math.max(0, inner - name.length - 4))}─┐`;
+  const elapsed = mmss(now - a.stateSince);
+  const detail = padEnd(a.dyingAt ? '*poof*' : a.detail, inner - 17);
+  const stats = a.tok ? `${fmtCost(a.cost)}·${fmtTok(a.tok)}` : '';
+  const proj = trunc(a.project || a.projectDir, inner - stats.length - 8);
+  const bot = stats
+    ? `└ ${stats} ${'─'.repeat(Math.max(0, inner - stats.length - proj.length - 5))} ${proj} ─┘`
+    : `└${'─'.repeat(Math.max(0, inner - proj.length - 3))} ${proj} ─┘`;
+  const b = (s) => color(fg, s);
+  return [
+    b(top),
+    b('│') + color('97', padCenter(frame[0], inner)) + b('│'),
+    b('│') + color(`1;${fg}`, padCenter(frame[1], inner)) + b('│'),
+    b('│') + ` ${color(`1;${fg}`, padEnd(label, 9))}${color('37', detail)} ${color('90', elapsed)} ` + b('│'),
+    b(bot),
+  ];
+}
+
+// ---------- tree view ----------
+function treeRow(a, prefix, now, cols, totals) {
+  const { key, frame } = currentFrame(a, now);
+  const [label, fg] = STYLE[key] || STYLE.thinking;
+  const isMain = a.kind === 'main';
+  const name = padEnd(a.name, isMain ? 25 : 27 - prefix.length);
+  const sprite = padEnd(`${frame[1]}${frame[0] ? '  ' + frame[0] : ''}`, 18);
+  const elapsed = mmss(now - a.stateSince);
+  const detail = padEnd(a.dyingAt ? '*poof*' : a.detail, Math.max(10, cols - 93));
+  const stats = (totals
+    ? `Σ ${fmtCost(totals.cost)} ${fmtTok(totals.tok)}`
+    : `${fmtCost(a.cost)} ${fmtTok(a.tok)}`).padStart(13);
+  const proj = trunc(a.project || a.projectDir, 14);
+  return ' ' + color('90', prefix) +
+    color(isMain ? '1;97' : '37', name) + ' ' +
+    color(`1;${fg}`, sprite) +
+    color(`1;${fg}`, padEnd(label, 9)) + ' ' +
+    color('37', detail) + ' ' +
+    color('33', stats) + ' ' +
+    color('90', `${elapsed}  ${proj}`);
+}
+
+function buildTreeLines(now, cols, maxLines) {
+  // group agents by session: main first, then its subagents
+  const groups = new Map();
+  for (const a of sortedAgents()) {
+    let g = groups.get(a.sessionId);
+    if (!g) groups.set(a.sessionId, (g = { main: null, subs: [] }));
+    if (a.kind === 'main' && !g.main) g.main = a;
+    else g.subs.push(a);
+  }
+  const out = [];
+  for (const [sessionId, g] of groups) {
+    if (g.main) out.push(treeRow(g.main, '@ ', now, cols, sessionTotals(sessionId)));
+    else out.push(color('90', ` @ session ${sessionId.slice(0, 8)} (gone)`));
+    g.subs.forEach((s, i) => {
+      out.push(treeRow(s, i === g.subs.length - 1 ? '└─ ' : '├─ ', now, cols));
+    });
+    out.push('');
+  }
+  if (out[out.length - 1] === '') out.pop();
+  if (out.length > maxLines) {
+    const hidden = out.length - (maxLines - 1);
+    out.length = maxLines - 1;
+    out.push(color('90', `   +${hidden} more…`));
+  }
+  return out;
+}
+
+function sortedAgents() {
+  return [...agents.values()].sort((x, y) =>
+    x.sessionId === y.sessionId
+      ? (x.kind === y.kind ? x.bornOrder - y.bornOrder : x.kind === 'main' ? -1 : 1)
+      : x.sessionId < y.sessionId ? -1 : 1
+  );
+}
+
+function buildScreen() {
+  const cols = process.stdout.columns || 100;
+  const rows = process.stdout.rows || 30;
+  const now = Date.now();
+  const list = sortedAgents();
+  const sessions = new Set(list.map((a) => a.sessionId)).size;
+
+  // reserve space for the activity ticker on tall enough terminals
+  const tickerH = rows >= 18 ? Math.min(6, 1 + Math.floor((rows - 12) / 2)) : 0;
+
+  const lines = [];
+  const title = color('1;96', ' *  claude-vis');
+  const mode = color('36', `[${viewMode}]`);
+  const liveSessionIds = new Set(list.map((a) => a.sessionId));
+  let totTok = list.reduce((s, a) => s + a.tok, 0);
+  let totCost = list.reduce((s, a) => s + a.cost, 0);
+  for (const e of retainedUsage.values()) {
+    if (liveSessionIds.has(e.sessionId)) { totTok += e.tok; totCost += e.cost; }
+  }
+  const stats = color('90', `${sessions} session${sessions === 1 ? '' : 's'} · ${list.length} agent${list.length === 1 ? '' : 's'} · ${fmtCost(totCost)} · ${fmtTok(totTok)} tok · ${new Date().toLocaleTimeString()}`);
+  lines.push(`${title} ${mode}  ${stats}`);
+  lines.push('');
+
+  if (list.length === 0) {
+    lines.push(color('90', '   waiting for Claude to wake up…'));
+    lines.push(color('90', `   (watching ~/.claude/projects for sessions active in the last ${Math.round(ACTIVE_WINDOW_MS / 60000)}m)`));
+  } else if (viewMode === 'tree') {
+    lines.push(...buildTreeLines(now, cols, Math.max(1, rows - 4 - tickerH)));
+  } else {
+    const perRow = Math.max(1, Math.floor((cols + 1) / (CARD_W + 1)));
+    const maxRows = Math.max(1, Math.floor((rows - 4 - tickerH) / 6));
+    const visible = list.slice(0, perRow * maxRows);
+    for (let i = 0; i < visible.length; i += perRow) {
+      const rowCards = visible.slice(i, i + perRow).map((a) => card(a, now));
+      for (let l = 0; l < 5; l++) lines.push(rowCards.map((c) => c[l]).join(' '));
+      lines.push('');
+    }
+    if (visible.length < list.length) lines.push(color('90', `   +${list.length - visible.length} more…`));
+  }
+
+  if (tickerH > 0) {
+    while (lines.length < rows - 1 - tickerH) lines.push('');
+    lines.length = rows - 1 - tickerH;
+    lines.push(color('90', ` ─── activity ${'─'.repeat(Math.max(0, cols - 15))}`));
+    const recent = ticker.slice(-(tickerH - 1));
+    for (const e of recent) {
+      const [label, fg] = STYLE[e.state] || STYLE.running;
+      const time = new Date(e.t).toLocaleTimeString();
+      lines.push(
+        ` ${color('90', padEnd(time, 11))} ${color('1;37', padEnd(e.agent.name, 15))} ` +
+        `${color(fg, padEnd(label, 9))} ${color('37', padEnd(e.detail, Math.max(10, cols - 56)))} ` +
+        color('90', trunc(e.agent.project || e.agent.projectDir, 14))
+      );
+    }
+  }
+  while (lines.length < rows - 1) lines.push('');
+  lines.length = rows - 1;
+  lines.push(color('90', ` q quit · t grid/tree · ${pricesSource} prices · sprites *poof* when agents finish`));
+  return lines;
+}
+
+function draw() {
+  const lines = buildScreen();
+  process.stdout.write(`${ESC}[H` + lines.map((l) => l + `${ESC}[K`).join('\n') + `${ESC}[J`);
+}
+
+// ---------- main ----------
+function cleanup() {
+  if (!ONCE) process.stdout.write(`${ESC}[?25h${ESC}[?1049l`);
+  process.exit(0);
+}
+
+function main() {
+  scan();
+  for (const a of agents.values()) ingest(a);
+
+  if (ONCE) {
+    lifecycle();
+    console.log(buildScreen().join('\n'));
+    return;
+  }
+
+  loadLivePrices(); // async — repricing kicks in when (and if) the fetch lands
+  probeProcesses(); // async — liveness verdicts apply as probes land
+
+  process.stdout.write(`${ESC}[?1049h${ESC}[?25l${ESC}[2J`);
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', (d) => {
+      const k = d.toString();
+      if (k === 'q' || k === '\x03') cleanup();
+      if (k === 't') { viewMode = viewMode === 'grid' ? 'tree' : 'grid'; draw(); }
+    });
+  }
+
+  setInterval(() => {
+    tick++;
+    if (tick % 17 === 1) scan();                       // discover new agents ~2s
+    if (tick % PROBE_TICKS === 2) probeProcesses();    // session liveness ~5s
+    if (tick % 2 === 0) for (const a of agents.values()) ingest(a); // tail ~4/s
+    lifecycle();
+    draw();
+  }, TICK_MS);
+}
+
+main();
