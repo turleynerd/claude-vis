@@ -5,7 +5,7 @@ and subagent gets a little animated sprite that thinks `.oO(?)`, reads `(o_o)[#]
 types `(>_<)/[=]`, runs commands `(o_o)>_`, and goes `*poof*` when it finishes.
 
 ```
-┌─ @ calm-waddling-harbor ─────────┐ ┌─ > test-writer ──────────────────┐
+┌─ @ brisk-juggling-comet ─────────┐ ┌─ > test-writer ──────────────────┐
 │             .oO ( ? )            │ │               $ /                │
 │              (o_O)               │ │             (o_o)>_              │
 │ THINK   reading results    00:05 │ │ RUN     Bash npm test      00:02 │
