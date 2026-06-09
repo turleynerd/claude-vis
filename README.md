@@ -35,11 +35,19 @@ claude-vis                       # watch everything active in the last 5 min
 claude-vis --project claude-vis  # only sessions whose project path matches
 claude-vis --window 15           # widen the activity window to 15 minutes
 claude-vis --tree                # start in tree view
+claude-vis --past                # start in the past-sessions view
+claude-vis --sort cost           # order past sessions by cost instead of date
+claude-vis --sort project        # group past sessions by project directory
 claude-vis --once                # print one frame and exit (no TUI)
 ```
 
 Keys: `t` toggles between the sprite grid and a relationship tree that nests
-each subagent under the session that spawned it; `q` quits.
+each subagent under the session that spawned it; `p` switches to the
+past-sessions view (and back); `s` cycles past ordering through date, cost,
+and project (grouped by directory, with per-project session counts and cost
+totals in the group headers); `q` quits. The tree and past views scroll with `j`/`k`, the arrow keys, or the
+mouse wheel (`ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a page, `g`/`G` jump to
+top/bottom).
 
 ```
  @ happy-demo-session    \(o_o)/ *   DELEGATE  Task dig into the docs  00:14
@@ -47,6 +55,19 @@ each subagent under the session that spawned it; `q` quits.
  ├─ test-writer          (>_<)/[=]   EDIT      Edit foo.test.ts        00:01
  └─ reviewer             (^o^)       TALK      Looks good overall, tw… 00:05
 ```
+
+The past view replaces the live grid/tree and activity ticker with the most
+recent finished sessions (capped at 15), each with its end time, total cost,
+and its priciest subagents nested under it:
+
+```
+ @ mutable-beaming-flame  (x_x)      ENDED     ended 2h ago   Σ $136 201.2m
+ ├─ engineer              (x_x)      ENDED                      $3.08 6.43m
+ └─ +12 more subagents (in Σ above)
+```
+
+Past tallies are scanned lazily — one transcript per tick — so a deep history
+never stalls the animation.
 
 The bottom of the screen shows a live activity ticker of recent events
 (tool calls, spawns, finishes) across all agents.

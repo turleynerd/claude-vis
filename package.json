@@ -1,6 +1,6 @@
 {
   "name": "claude-vis",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Animated terminal sprites for your running Claude Code agents",
   "bin": {
     "claude-vis": "./index.js"

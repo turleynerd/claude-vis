@@ -35,25 +35,36 @@ options:
   --project <name>   only show sessions whose project path contains <name>
   --window <mins>    treat sessions modified in the last N minutes as live (default 5)
   --tree             start in tree view (press t to toggle at runtime)
+  --past             start in the past-sessions view
+  --sort <key>       order past sessions by "date" (default), "cost", or
+                     "project" (grouped by directory)
   --once             render a single frame to stdout and exit (no TUI)
   -v, --version      print version
   -h, --help         show this help
 
 keys:
   t                  toggle sprite grid / relationship tree
+  p                  toggle the past-sessions view
+  s                  cycle past-session order: date / cost / project
+  j/k, arrows, wheel scroll the tree and past views
+  ctrl-d/u, PgDn/Up  scroll half a page; g jumps to top, G to bottom
   q                  quit`);
   process.exit(0);
 }
 const FILTER = argVal('--project', null);
 const ACTIVE_WINDOW_MS = parseFloat(argVal('--window', '5')) * 60_000;
 const ONCE = args.includes('--once');
-let viewMode = args.includes('--tree') ? 'tree' : 'grid';
+let viewMode = args.includes('--past') ? 'past' : args.includes('--tree') ? 'tree' : 'grid';
+let liveView = viewMode === 'past' ? 'grid' : viewMode; // view to return to when leaving past
+let pastSort = ['cost', 'project'].includes(argVal('--sort', 'date')) ? argVal('--sort', 'date') : 'date';
+let scrollY = 0; // tree/past list scroll offset, clamped at render time
 
 const TICK_MS = 120;          // render tick
 const IDLE_AFTER_MS = 20_000; // no transcript lines for this long -> zzz
 const SUB_DONE_AFTER_MS = 90_000;    // quiet subagent file -> done, despawn
 const MAIN_GONE_AFTER_MS = 10 * 60_000; // quiet main session -> despawn
 const DEATH_MS = 1300;        // length of the *poof* animation
+const PAST_MAX = 15;          // most recent past sessions kept in the tree view
 
 // ---------- sprite animation frames: [thought-bubble line, body line] ----------
 const ANIM = {
@@ -270,6 +281,10 @@ async function loadLivePrices() {
       t.cost += e.cost;
     }
   }
+  // past tallies don't keep per-request entries — rescan them at live prices
+  pastSessions.clear();
+  pastScanQueue.length = 0;
+  if (viewMode === 'past') scanPastSessions();
 }
 
 // Transcripts repeat the same usage on every line of a streamed message, so
@@ -340,13 +355,21 @@ function applyLine(agent, obj) {
       if (b.type === 'thinking') setState(agent, 'thinking', '');
       else if (b.type === 'text') setState(agent, 'talking', squish(b.text || '', 60));
       else if (b.type === 'tool_use') {
-        setState(agent, toolState(b.name), squish(`${b.name} ${toolDetail(b.input)}`, 60));
+        const st = toolState(b.name);
+        setState(agent, st, squish(`${b.name} ${toolDetail(b.input)}`, 60));
+        if (st === 'editing' && b.id) agent.editToolIds.add(b.id);
       }
     }
   } else if (obj.type === 'user') {
     const c = obj.message && obj.message.content;
     if (Array.isArray(c) && c.some((b) => b && b.type === 'tool_result')) {
-      setState(agent, 'thinking', 'reading results');
+      // an edit's result lands while the agent is usually already writing the
+      // next change — hold EDIT instead of flashing back to THINK
+      let editDone = false;
+      for (const b of c) {
+        if (b && b.type === 'tool_result' && agent.editToolIds.delete(b.tool_use_id)) editDone = true;
+      }
+      if (!(editDone && agent.state === 'editing')) setState(agent, 'thinking', 'reading results');
     } else if (typeof c === 'string' || Array.isArray(c)) {
       setState(agent, 'prompted', 'new instructions');
     }
@@ -410,6 +433,7 @@ function ensureAgent(meta) {
     probeSeen: 0,
     probeMisses: 0,
     phase: hashPhase(meta.file),
+    editToolIds: new Set(),
     usageByReq: new Map(),
     tok: 0,
     cost: 0,
@@ -494,20 +518,14 @@ function primeFromTail(agent, size) {
   const lines = chunk.split('\n').filter((l) => l.trim());
   // first line of the tail may be partial; drop it unless we read from 0
   if (start > 0) lines.shift();
-  let lastValid = null;
+  // replay the tail in order so derived state (current activity, in-flight
+  // edit ids) matches what live tailing would have produced; usage re-adds
+  // are idempotent (keyed by requestId)
   for (const line of lines) {
     try {
-      const obj = JSON.parse(line);
-      if (agent.kind === 'main' && obj.slug) agent.name = obj.slug;
-      if (obj.attributionAgent) agent.name = obj.attributionAgent;
-      if (obj.cwd) {
-        agent.cwd = obj.cwd;
-        if (!agent.project) agent.project = path.basename(obj.cwd);
-      }
-      if (obj.type === 'user' || obj.type === 'assistant') lastValid = obj;
+      applyLine(agent, JSON.parse(line));
     } catch { /* partial or non-json line */ }
   }
-  if (lastValid) applyLine(agent, lastValid);
   agent.stateSince = agent.mtimeMs;
 }
 
@@ -578,6 +596,107 @@ function scan() {
       }
     }
   }
+}
+
+// ---------- past sessions ----------
+// Finished sessions shown (greyed out) under the live tree when toggled on.
+// Discovery is cheap (readdir + stat); usage tallies are scanned one file per
+// tick off a queue so a deep history never freezes the render loop.
+const pastSessions = new Map(); // main session file -> entry
+const pastScanQueue = [];
+
+function pastTarget(file, kind, name) {
+  return { file, kind, name, project: '', cwd: '', mtimeMs: 0, tok: 0, cost: 0, scanned: false };
+}
+
+function scanPastSessions() {
+  const now = Date.now();
+  let projDirs;
+  try { projDirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true }); } catch { return; }
+  const found = [];
+  for (const pd of projDirs) {
+    if (!pd.isDirectory() || !matchesFilter(pd.name)) continue;
+    const projPath = path.join(PROJECTS_DIR, pd.name);
+    let entries;
+    try { entries = fs.readdirSync(projPath, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
+      const file = path.join(projPath, e.name);
+      if (agents.has(file)) continue; // live right now
+      const st = safeStat(file);
+      if (!st) continue;
+      // recent and never poofed -> scan() is about to pick it up as live
+      if (now - st.mtimeMs <= ACTIVE_WINDOW_MS && !deadFiles.has(file)) continue;
+      found.push({ file, projectDir: pd.name, sessionId: e.name.slice(0, -6), mtimeMs: st.mtimeMs });
+    }
+  }
+  found.sort((x, y) => y.mtimeMs - x.mtimeMs);
+  if (found.length > PAST_MAX) found.length = PAST_MAX;
+  const keep = new Set();
+  for (const f of found) {
+    keep.add(f.file);
+    let p = pastSessions.get(f.file);
+    if (!p) {
+      p = pastTarget(f.file, 'main', f.sessionId.slice(0, 8)); // until the slug is scanned
+      p.sessionId = f.sessionId;
+      p.projectDir = f.projectDir;
+      p.subs = new Map(); // sub file -> target
+      pastSessions.set(f.file, p);
+      pastScanQueue.push(p);
+    }
+    p.mtimeMs = f.mtimeMs;
+    const subDir = path.join(PROJECTS_DIR, f.projectDir, f.sessionId, 'subagents');
+    let subs;
+    try { subs = fs.readdirSync(subDir); } catch { continue; }
+    for (const s of subs) {
+      if (!s.endsWith('.jsonl')) continue;
+      const sf = path.join(subDir, s);
+      if (p.subs.has(sf)) continue;
+      const sst = safeStat(sf);
+      if (!sst) continue;
+      const t = pastTarget(sf, 'sub', s.slice(0, -6).replace(/^agent-(.{4}).*/, 'agent-$1'));
+      t.mtimeMs = sst.mtimeMs;
+      t.parentFile = f.file;
+      p.subs.set(sf, t);
+      pastScanQueue.push(t);
+    }
+  }
+  for (const k of pastSessions.keys()) {
+    if (!keep.has(k)) pastSessions.delete(k);
+  }
+}
+
+// tally one queued transcript per call so the render loop stays smooth
+function processPastScans() {
+  while (pastScanQueue.length) {
+    const t = pastScanQueue.shift();
+    if (!pastSessions.has(t.kind === 'sub' ? t.parentFile : t.file)) continue; // pruned
+    const st = safeStat(t.file);
+    if (!st) { t.scanned = true; continue; }
+    const tmp = { kind: t.kind, name: t.name, project: '', cwd: '', usageByReq: new Map(), tok: 0, cost: 0 };
+    scanUsageInto(tmp, t.file, st.size);
+    t.tok = tmp.tok;
+    t.cost = tmp.cost;
+    t.name = tmp.name;
+    t.project = tmp.project;
+    t.scanned = true;
+    return;
+  }
+}
+
+function pastSessionTotals(p) {
+  let tok = p.tok;
+  let cost = p.cost;
+  for (const s of p.subs.values()) { tok += s.tok; cost += s.cost; }
+  return { tok, cost };
+}
+
+function sortedPastSessions() {
+  return [...pastSessions.values()].sort((x, y) =>
+    pastSort === 'cost'
+      ? pastSessionTotals(y).cost - pastSessionTotals(x).cost
+      : y.mtimeMs - x.mtimeMs
+  );
 }
 
 // ---------- ingest ----------
@@ -735,6 +854,21 @@ function mmss(ms) {
   const t = Math.max(0, Math.floor(ms / 1000));
   return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
 }
+function agoStr(ms) {
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+function whenStr(t) {
+  const d = new Date(t);
+  if (d.toDateString() === new Date().toDateString()) {
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+  return `${d.toLocaleString('en', { month: 'short' })} ${d.getDate()}`;
+}
 
 function currentFrame(a, now) {
   let key = a.state;
@@ -801,6 +935,38 @@ function treeRow(a, prefix, now, cols, totals) {
     color('90', `${elapsed}  ${proj}`);
 }
 
+function pastRow(t, prefix, now, cols, totals) {
+  const isMain = t.kind === 'main';
+  const name = padEnd(t.name, isMain ? 25 : 27 - prefix.length);
+  const sprite = padEnd('(x_x)', 18);
+  const detail = padEnd(
+    !t.scanned ? 'tallying…' : isMain ? `ended ${agoStr(now - t.mtimeMs)}` : '',
+    Math.max(10, cols - 93));
+  const stats = (totals
+    ? `Σ ${fmtCost(totals.cost)} ${fmtTok(totals.tok)}`
+    : `${fmtCost(t.cost)} ${fmtTok(t.tok)}`).padStart(13);
+  const proj = trunc(t.project || (t.projectDir ? projectFromDirName(t.projectDir) : ''), 14);
+  return ' ' + color('90', prefix) +
+    color(isMain ? '37' : '90', name) + ' ' +
+    color('90', sprite) +
+    color('90', padEnd('ENDED', 9)) + ' ' +
+    color('90', detail) + ' ' +
+    color('33', stats) + ' ' +
+    color('90', `${padEnd(whenStr(t.mtimeMs), 6)} ${proj}`);
+}
+
+// slice a full list of content lines to the visible window at scrollY, with
+// "more above/below" markers in the edge rows
+function windowLines(all, maxLines) {
+  scrollY = Math.max(0, Math.min(scrollY, all.length - maxLines));
+  if (all.length <= maxLines) return all;
+  const view = all.slice(scrollY, scrollY + maxLines);
+  if (scrollY > 0) view[0] = color('90', `   ↑ ${scrollY} more…`);
+  const below = all.length - scrollY - maxLines;
+  if (below > 0) view[view.length - 1] = color('90', `   ↓ ${below} more…`);
+  return view;
+}
+
 function buildTreeLines(now, cols, maxLines) {
   // group agents by session: main first, then its subagents
   const groups = new Map();
@@ -820,12 +986,45 @@ function buildTreeLines(now, cols, maxLines) {
     out.push('');
   }
   if (out[out.length - 1] === '') out.pop();
-  if (out.length > maxLines) {
-    const hidden = out.length - (maxLines - 1);
-    out.length = maxLines - 1;
-    out.push(color('90', `   +${hidden} more…`));
+  return windowLines(out, maxLines);
+}
+
+function buildPastLines(now, cols, maxLines) {
+  const out = [];
+  const pushSession = (p) => {
+    out.push(pastRow(p, '@ ', now, cols, pastSessionTotals(p)));
+    // big agent teams would crowd out other sessions — show the priciest few
+    const subs = [...p.subs.values()].sort((x, y) => y.cost - x.cost);
+    const hidden = Math.max(0, subs.length - 6);
+    subs.length -= hidden;
+    subs.forEach((s, i) => {
+      out.push(pastRow(s, i === subs.length - 1 && !hidden ? '└─ ' : '├─ ', now, cols));
+    });
+    if (hidden) out.push(color('90', ` └─ +${hidden} more subagents (in Σ above)`));
+    out.push('');
+  };
+  if (pastSort === 'project') {
+    // group by project directory, most recently active project first
+    const groups = new Map(); // projectDir -> sessions, newest first
+    for (const p of [...pastSessions.values()].sort((x, y) => y.mtimeMs - x.mtimeMs)) {
+      let g = groups.get(p.projectDir);
+      if (!g) groups.set(p.projectDir, (g = []));
+      g.push(p);
+    }
+    for (const [dir, sessions] of groups) {
+      const totals = sessions.map(pastSessionTotals);
+      const cost = totals.reduce((s, t) => s + t.cost, 0);
+      const tok = totals.reduce((s, t) => s + t.tok, 0);
+      const name = sessions.find((p) => p.project)?.project || projectFromDirName(dir);
+      const head = ` ─── ${name} · ${sessions.length} session${sessions.length === 1 ? '' : 's'} · Σ ${fmtCost(cost)} ${fmtTok(tok)} `;
+      out.push(color('90', head + '─'.repeat(Math.max(0, cols - head.length - 1))));
+      for (const p of sessions) pushSession(p);
+    }
+  } else {
+    for (const p of sortedPastSessions()) pushSession(p);
   }
-  return out;
+  if (out[out.length - 1] === '') out.pop();
+  return windowLines(out, maxLines);
 }
 
 function sortedAgents() {
@@ -843,23 +1042,44 @@ function buildScreen() {
   const list = sortedAgents();
   const sessions = new Set(list.map((a) => a.sessionId)).size;
 
-  // reserve space for the activity ticker on tall enough terminals
-  const tickerH = rows >= 18 ? Math.min(6, 1 + Math.floor((rows - 12) / 2)) : 0;
+  // reserve space for the activity ticker on tall enough terminals; the past
+  // view has no live activity to show, so it gets the whole screen
+  const tickerH = viewMode !== 'past' && rows >= 18 ? Math.min(6, 1 + Math.floor((rows - 12) / 2)) : 0;
 
   const lines = [];
   const title = color('1;96', ' *  claude-vis');
   const mode = color('36', `[${viewMode}]`);
-  const liveSessionIds = new Set(list.map((a) => a.sessionId));
-  let totTok = list.reduce((s, a) => s + a.tok, 0);
-  let totCost = list.reduce((s, a) => s + a.cost, 0);
-  for (const e of retainedUsage.values()) {
-    if (liveSessionIds.has(e.sessionId)) { totTok += e.tok; totCost += e.cost; }
+  let stats;
+  if (viewMode === 'past') {
+    let totTok = 0;
+    let totCost = 0;
+    for (const p of pastSessions.values()) {
+      const t = pastSessionTotals(p);
+      totTok += t.tok;
+      totCost += t.cost;
+    }
+    const n = pastSessions.size;
+    stats = color('90', `${n} past session${n === 1 ? '' : 's'} · by ${pastSort} · ${fmtCost(totCost)} · ${fmtTok(totTok)} tok · ${new Date().toLocaleTimeString()}`);
+  } else {
+    const liveSessionIds = new Set(list.map((a) => a.sessionId));
+    let totTok = list.reduce((s, a) => s + a.tok, 0);
+    let totCost = list.reduce((s, a) => s + a.cost, 0);
+    for (const e of retainedUsage.values()) {
+      if (liveSessionIds.has(e.sessionId)) { totTok += e.tok; totCost += e.cost; }
+    }
+    stats = color('90', `${sessions} session${sessions === 1 ? '' : 's'} · ${list.length} agent${list.length === 1 ? '' : 's'} · ${fmtCost(totCost)} · ${fmtTok(totTok)} tok · ${new Date().toLocaleTimeString()}`);
   }
-  const stats = color('90', `${sessions} session${sessions === 1 ? '' : 's'} · ${list.length} agent${list.length === 1 ? '' : 's'} · ${fmtCost(totCost)} · ${fmtTok(totTok)} tok · ${new Date().toLocaleTimeString()}`);
   lines.push(`${title} ${mode}  ${stats}`);
   lines.push('');
 
-  if (list.length === 0) {
+  if (viewMode === 'past') {
+    if (pastSessions.size === 0) {
+      lines.push(color('90', '   no past sessions found yet…'));
+      lines.push(color('90', '   (scanning ~/.claude/projects for finished transcripts)'));
+    } else {
+      lines.push(...buildPastLines(now, cols, Math.max(1, rows - 4)));
+    }
+  } else if (list.length === 0) {
     lines.push(color('90', '   waiting for Claude to wake up…'));
     lines.push(color('90', `   (watching ~/.claude/projects for sessions active in the last ${Math.round(ACTIVE_WINDOW_MS / 60000)}m)`));
   } else if (viewMode === 'tree') {
@@ -893,7 +1113,9 @@ function buildScreen() {
   }
   while (lines.length < rows - 1) lines.push('');
   lines.length = rows - 1;
-  lines.push(color('90', ` q quit · t grid/tree · ${pricesSource} prices · sprites *poof* when agents finish`));
+  lines.push(color('90', viewMode === 'past'
+    ? ` q quit · p back to live · s sort (${pastSort}) · j/k scroll · ${pricesSource} prices`
+    : ` q quit · t grid/tree · p past · j/k scroll · ${pricesSource} prices · sprites *poof* when agents finish`));
   return lines;
 }
 
@@ -903,8 +1125,45 @@ function draw() {
 }
 
 // ---------- main ----------
+function handleKey(k) {
+  if (k === 'q' || k === '\x03') cleanup();
+  if (k === 't') {
+    viewMode = liveView = viewMode === 'grid' ? 'tree' : 'grid';
+    scrollY = 0;
+    draw();
+  }
+  if (k === 'p') {
+    if (viewMode === 'past') {
+      viewMode = liveView;
+    } else {
+      liveView = viewMode;
+      viewMode = 'past';
+      scanPastSessions();
+    }
+    scrollY = 0;
+    draw();
+  }
+  if (k === 's') {
+    pastSort = pastSort === 'date' ? 'cost' : pastSort === 'cost' ? 'project' : 'date';
+    scrollY = 0;
+    draw();
+  }
+  // scrolling: vim keys, arrows, page keys, mouse wheel (SGR buttons 64/65)
+  const half = Math.max(1, Math.floor((process.stdout.rows || 30) / 2));
+  let delta = 0;
+  if (k === 'j' || k === `${ESC}[B`) delta = 1;
+  if (k === 'k' || k === `${ESC}[A`) delta = -1;
+  if (k === '\x04' || k === `${ESC}[6~`) delta = half;  // ctrl-d / PgDn
+  if (k === '\x15' || k === `${ESC}[5~`) delta = -half; // ctrl-u / PgUp
+  if (k === 'g') { scrollY = 0; draw(); }
+  if (k === 'G') { scrollY = Number.MAX_SAFE_INTEGER; draw(); } // clamped at render
+  const wheel = k.match(/^\x1b\[<(6[45]);/);
+  if (wheel) delta = wheel[1] === '64' ? -3 : 3;
+  if (delta) { scrollY = Math.max(0, scrollY + delta); draw(); }
+}
+
 function cleanup() {
-  if (!ONCE) process.stdout.write(`${ESC}[?25h${ESC}[?1049l`);
+  if (!ONCE) process.stdout.write(`${ESC}[?1006l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
   process.exit(0);
 }
 
@@ -913,6 +1172,10 @@ function main() {
   for (const a of agents.values()) ingest(a);
 
   if (ONCE) {
+    if (viewMode === 'past') {
+      scanPastSessions();
+      while (pastScanQueue.length) processPastScans();
+    }
     lifecycle();
     console.log(buildScreen().join('\n'));
     return;
@@ -920,17 +1183,20 @@ function main() {
 
   loadLivePrices(); // async — repricing kicks in when (and if) the fetch lands
   probeProcesses(); // async — liveness verdicts apply as probes land
+  if (viewMode === 'past') scanPastSessions();
 
-  process.stdout.write(`${ESC}[?1049h${ESC}[?25l${ESC}[2J`);
+  // alt screen, hidden cursor, mouse button reporting (SGR) for wheel scroll
+  process.stdout.write(`${ESC}[?1049h${ESC}[?25l${ESC}[2J${ESC}[?1000h${ESC}[?1006h`);
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on('data', (d) => {
-      const k = d.toString();
-      if (k === 'q' || k === '\x03') cleanup();
-      if (k === 't') { viewMode = viewMode === 'grid' ? 'tree' : 'grid'; draw(); }
+      // batched input (key repeat, wheel bursts) lands in one chunk — split
+      // it into mouse reports, CSI sequences, and single keys
+      const keys = d.toString().match(/\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[[0-9;]*[A-Za-z~]|[\s\S]/g) || [];
+      for (const k of keys) handleKey(k);
     });
   }
 
@@ -938,6 +1204,8 @@ function main() {
     tick++;
     if (tick % 17 === 1) scan();                       // discover new agents ~2s
     if (tick % PROBE_TICKS === 2) probeProcesses();    // session liveness ~5s
+    if (viewMode === 'past' && tick % 17 === 9) scanPastSessions(); // refresh past list ~2s
+    if (viewMode === 'past') processPastScans();       // tally one transcript per tick
     if (tick % 2 === 0) for (const a of agents.values()) ingest(a); // tail ~4/s
     lifecycle();
     draw();
