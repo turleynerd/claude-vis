@@ -1036,8 +1036,8 @@ function sortedAgents() {
 }
 
 function buildScreen() {
-  const cols = process.stdout.columns || 100;
-  const rows = process.stdout.rows || 30;
+  const cols = process.stdout.columns || parseInt(process.env.COLUMNS, 10) || 100;
+  const rows = process.stdout.rows || parseInt(process.env.LINES, 10) || 30;
   const now = Date.now();
   const list = sortedAgents();
   const sessions = new Set(list.map((a) => a.sessionId)).size;

@@ -4,13 +4,7 @@ Watch your Claude Code agents come to life in the terminal. Every live session
 and subagent gets a little animated sprite that thinks `.oO(?)`, reads `(o_o)[#]`,
 types `(>_<)/[=]`, runs commands `(o_o)>_`, and goes `*poof*` when it finishes.
 
-```
-┌─ @ brisk-juggling-comet ─────────┐ ┌─ > test-writer ──────────────────┐
-│             .oO ( ? )            │ │               $ /                │
-│              (o_O)               │ │             (o_o)>_              │
-│ THINK   reading results    00:05 │ │ RUN     Bash npm test      00:02 │
-└───────────────────── claude-vis ─┘ └───────────────────── claude-vis ─┘
-```
+<img alt="claude-vis grid view: four animated agent cards — a main session delegating work plus researcher, test-writer, and reviewer subagents — each with its state, current activity, and running cost" src="assets/grid.svg" width="820">
 
 ## Install
 
@@ -21,18 +15,11 @@ brew install turleynerd/tap/claude-vis
 Self-contained binary (macOS/Linux, arm64/x64) — no Node required. Running
 from a source checkout with `node index.js` (Node ≥18) works too.
 
-## How it works
-
-Claude Code writes session transcripts as JSONL to `~/.claude/projects/`
-(subagents get their own files under `<session-id>/subagents/`). claude-vis
-tails those files and animates each agent based on the latest event — no
-hooks, no config, and no changes needed in the session being watched.
-
 ## Usage
 
 ```sh
 claude-vis                       # watch everything active in the last 5 min
-claude-vis --project claude-vis  # only sessions whose project path matches
+claude-vis --project rocket      # only sessions whose project path matches
 claude-vis --window 15           # widen the activity window to 15 minutes
 claude-vis --tree                # start in tree view
 claude-vis --past                # start in the past-sessions view
@@ -41,70 +28,51 @@ claude-vis --sort project        # group past sessions by project directory
 claude-vis --once                # print one frame and exit (no TUI)
 ```
 
-Keys: `t` toggles between the sprite grid and a relationship tree that nests
-each subagent under the session that spawned it; `p` switches to the
-past-sessions view (and back); `s` cycles past ordering through date, cost,
-and project; `q` quits. The tree and past views scroll with `j`/`k`, the
-arrow keys, or the mouse wheel (`ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a
-page, `g`/`G` jump to top/bottom).
+Keys: `t` toggles grid/tree, `p` toggles the past-sessions view, `s` cycles
+past ordering (date / cost / project), `q` quits. The tree and past views
+scroll with `j`/`k`, the arrow keys, or the mouse wheel — `ctrl-d`/`ctrl-u`
+and PgDn/PgUp jump half a page, `g`/`G` jump to top/bottom.
 
-```
- @ happy-demo-session    \(o_o)/ *   DELEGATE  Task dig into the docs  00:14
- ├─ researcher           (o_O) .oO   THINK     reading results         00:02
- ├─ test-writer          (>_<)/[=]   EDIT      Edit foo.test.ts        00:01
- └─ reviewer             (^o^)       TALK      Looks good overall, tw… 00:05
-```
+## Tree view
 
-The past view replaces the live grid/tree and activity ticker with the most
-recent finished sessions (capped at 15) — the same tree layout, but for your
-history: each session shows when it ended, its total cost and tokens (Σ spans
-the session plus all of its subagents), and its priciest subagents nested
-under it:
+The tree nests each subagent under the session that spawned it, with one row
+per agent: sprite, state, what it's doing right now, and a running cost — the
+`Σ` on the session row spans the whole team.
 
-```
- *  claude-vis [past]  4 past sessions · by date · $61.9 · 88.40m tok
+<img alt="claude-vis tree view: a session row with Σ cost followed by indented researcher, test-writer, and reviewer rows, each with its own state and cost" src="assets/tree.svg" width="980">
 
- @ brisk-juggling-comet    (x_x)  ENDED  ended 12m ago  Σ $28.4 41.20m  13:50  rocket-shop
- ├─ engineer               (x_x)  ENDED                   $4.12  8.91m  13:42  rocket-shop
- ├─ test-writer            (x_x)  ENDED                   $2.30  4.05m  13:47  rocket-shop
- └─ +6 more subagents (in Σ above)
+The bottom of the screen also shows a live activity ticker of recent events
+(tool calls, spawns, finishes) across all agents.
 
- @ quiet-painting-meadow   (x_x)  ENDED  ended 3h ago   Σ $19.7 30.16m  11:04  todo-app
- └─ researcher             (x_x)  ENDED                   $1.88  3.42m  10:58  todo-app
-```
+## Past sessions
 
-Sorting by project groups sessions by directory and rolls the cost up into
-the group headers — a quick answer to "what has each project cost me lately?":
+Press `p` for your history: the most recent finished sessions (capped at 15)
+in the same tree layout — when each ended, what it cost in dollars and
+tokens, and its priciest subagents nested under it.
 
-```
- ─── rocket-shop · 3 sessions · Σ $44.6 63.71m ────────────────────────────
- @ brisk-juggling-comet    (x_x)  ENDED  ended 12m ago  Σ $28.4 41.20m  13:50  rocket-shop
- @ floating-mango-sunrise  (x_x)  ENDED  ended 1d ago   Σ $16.2 22.51m  Jun 8  rocket-shop
+<img alt="claude-vis past view: greyed-out finished sessions, each showing when it ended, Σ cost and tokens, and its subagents with their own tallies" src="assets/past.svg" width="980">
 
- ─── todo-app · 1 session · Σ $19.7 30.16m ────────────────────────────────
- @ quiet-painting-meadow   (x_x)  ENDED  ended 3h ago   Σ $19.7 30.16m  11:04  todo-app
-```
+Sorting by project (`s`, or `--sort project`) groups sessions by directory
+and rolls the cost up into the group headers — a quick answer to "what has
+each project cost me lately?":
+
+<img alt="claude-vis past view grouped by project: rocket-shop and todo-app headers with per-project session counts and Σ cost, sessions listed under each" src="assets/past-project.svg" width="980">
 
 Past tallies are scanned lazily — one transcript per tick — so a deep history
 never stalls the animation.
 
-The bottom of the screen shows a live activity ticker of recent events
-(tool calls, spawns, finishes) across all agents.
+## Costs
 
-Each agent also shows a running token/cost tally (`$3.31·609.5k`) computed
-from the `usage` blocks in its transcript, deduped by request ID, with cache
-reads/writes priced separately. Pre-existing sessions are scanned in full at
-startup, so tallies reflect the whole session, not just what happened since
-launch.
+Every tally is computed from the `usage` blocks in the agent's transcript,
+deduped by request ID, with cache reads/writes priced separately. Pre-existing
+sessions are scanned in full at startup, so totals reflect the whole session,
+not just what happened since launch.
 
 Per-model prices are fetched at launch from LiteLLM's community pricing data
 (there is no official Anthropic pricing API) and existing tallies are repriced
 when the fetch lands. If the fetch fails or a model isn't listed yet, a
 built-in per-family table is used instead — the footer shows whether `live`
 or `static` prices are in effect.
-
-Set `CLAUDE_VIS_PROJECTS_DIR` to watch a directory other than
-`~/.claude/projects` (handy for demos and testing).
 
 ## States
 
@@ -119,8 +87,20 @@ Set `CLAUDE_VIS_PROJECTS_DIR` to watch a directory other than
 | `(-_-) zZz`   | IDLE     | no transcript activity for 20s                |
 | `(x_x)`       | DONE     | agent finished — sprite poofs away            |
 
+## How it works
+
+Claude Code writes session transcripts as JSONL to `~/.claude/projects/`
+(subagents get their own files under `<session-id>/subagents/`). claude-vis
+tails those files and animates each agent based on the latest event — no
+hooks, no config, and no changes needed in the session being watched.
+
 A session *poofs* as soon as its Claude process disappears from the process
 table (closing Claude is detected within ~10s, via `--session-id`/`--resume`
 in argv or a claude binary whose cwd is the project root). Sessions whose
 process can't be identified fall back to timers: subagents despawn after 90s
 of silence, main sessions after 10 minutes.
+
+Set `CLAUDE_VIS_PROJECTS_DIR` to watch a directory other than
+`~/.claude/projects` (handy for demos and testing). The screenshots above are
+real frames rendered against a synthetic fixture of placeholder projects —
+regenerate them with `node scripts/readme-svgs.js`.
