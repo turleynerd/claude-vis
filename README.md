@@ -104,7 +104,6 @@ sprite — the animations, props, and *poof* stay the same:
 | `cats`   | `(=o.o=)` | `(=>.<=)/[=]` | `(=^o^=)` | `(=x.x=)` |
 | `owls`   | `{o,o}`   | `{>,<}/[=]`   | `{^,^}`   | `{x,x}`   |
 | `ghosts` | `(~o_o)~` | `(~>_<)~/[=]` | `(~^o^)~` | `(~x_x)~` |
-| `spooky` | `(8_8)`   | `(8x8)/[=]`   | `(8v8)`   | `[RIP]`   |
 
 ## How it works
 

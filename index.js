@@ -38,7 +38,7 @@ options:
   --past             start in the past-sessions view
   --sort <key>       order past sessions by "date" (default), "cost", or
                      "project" (grouped by directory)
-  --theme <name>     sprite theme: people, bots, cats, owls, ghosts, spooky
+  --theme <name>     sprite theme: people, bots, cats, owls, ghosts
   --once             render a single frame to stdout and exit (no TUI)
   -v, --version      print version
   -h, --help         show this help
@@ -156,10 +156,6 @@ const THEMES = {
   ghosts: {
     '(o_o)': '(~o_o)~', '(o_O)': '(~o_O)~', '(O_O)': '(~O_O)~', '(-_-)': '(~-_-)~',
     '(>_<)': '(~>_<)~', '(^o^)': '(~^o^)~', '(^_^)': '(~^_^)~', '(x_x)': '(~x_x)~',
-  },
-  spooky: {
-    '(o_o)': '(8_8)', '(o_O)': '(8_0)', '(O_O)': '(0_0)', '(-_-)': '(=_=)',
-    '(>_<)': '(8x8)', '(^o^)': '(8v8)', '(^_^)': '(8v8)', '(x_x)': '[RIP]',
   },
 };
 const THEME_NAMES = Object.keys(THEMES);
