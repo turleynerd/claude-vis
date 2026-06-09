@@ -68,11 +68,13 @@ deduped by request ID, with cache reads/writes priced separately. Pre-existing
 sessions are scanned in full at startup, so totals reflect the whole session,
 not just what happened since launch.
 
-Per-model prices are fetched at launch from LiteLLM's community pricing data
-(there is no official Anthropic pricing API) and existing tallies are repriced
-when the fetch lands. If the fetch fails or a model isn't listed yet, a
-built-in per-family table is used instead — the footer shows whether `live`
-or `static` prices are in effect.
+Per-model prices are fetched at launch from [LiteLLM](https://github.com/BerriAI/litellm)'s
+community-maintained [model pricing sheet](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)
+(there is no official Anthropic pricing API — thanks to the LiteLLM folks for
+keeping this data current), and existing tallies are repriced when the fetch
+lands. If the fetch fails or a model isn't listed yet, a built-in per-family
+table is used instead — the footer shows whether `live` or `static` prices
+are in effect.
 
 ## States
 
