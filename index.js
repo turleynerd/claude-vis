@@ -38,17 +38,16 @@ options:
   --past             start in the past-sessions view
   --sort <key>       order past sessions by "date" (default), "cost", or
                      "project" (grouped by directory)
-  --theme <name>     sprite theme: people (o_o), bots [o_o], cats (=^.^=),
-                     owls {o,o}
+  --theme <name>     sprite theme: people, bots, cats, owls, ghosts, spooky
   --once             render a single frame to stdout and exit (no TUI)
   -v, --version      print version
   -h, --help         show this help
 
 keys:
-  t                  toggle sprite grid / relationship tree
+  v                  toggle sprite grid / relationship tree
+  t                  pick a sprite theme (menu, arrow keys, live preview)
   p                  toggle the past-sessions view
   s                  cycle past-session order: date / cost / project
-  c                  cycle sprite theme: people / bots / cats / owls
   j/k, arrows, wheel scroll the tree and past views
   ctrl-d/u, PgDn/Up  scroll half a page; g jumps to top, G to bottom
   q                  quit`);
@@ -154,9 +153,19 @@ const THEMES = {
     '(o_o)': '{o,o}', '(o_O)': '{o,O}', '(O_O)': '{O,O}', '(-_-)': '{-,-}',
     '(>_<)': '{>,<}', '(^o^)': '{^,^}', '(^_^)': '{^,^}', '(x_x)': '{x,x}',
   },
+  ghosts: {
+    '(o_o)': '(~o_o)~', '(o_O)': '(~o_O)~', '(O_O)': '(~O_O)~', '(-_-)': '(~-_-)~',
+    '(>_<)': '(~>_<)~', '(^o^)': '(~^o^)~', '(^_^)': '(~^_^)~', '(x_x)': '(~x_x)~',
+  },
+  spooky: {
+    '(o_o)': '(8_8)', '(o_O)': '(8_0)', '(O_O)': '(0_0)', '(-_-)': '(=_=)',
+    '(>_<)': '(8x8)', '(^o^)': '(8v8)', '(^_^)': '(8v8)', '(x_x)': '[RIP]',
+  },
 };
 const THEME_NAMES = Object.keys(THEMES);
 let theme = THEME_NAMES.includes(argVal('--theme', 'people')) ? argVal('--theme', 'people') : 'people';
+let themeMenu = -1;      // selected row while the picker is open, -1 = closed
+let themeBefore = null;  // theme to restore if the picker is cancelled
 
 function themedFace(face) {
   return (THEMES[theme] && THEMES[theme][face]) || face;
@@ -173,6 +182,11 @@ function themedAnim(name) {
   return out;
 }
 let anim = themedAnim(theme);
+
+function setTheme(name) {
+  theme = name;
+  anim = themedAnim(name);
+}
 
 // state -> [label, ansi fg color]
 const STYLE = {
@@ -1155,9 +1169,36 @@ function buildScreen() {
   while (lines.length < rows - 1) lines.push('');
   lines.length = rows - 1;
   lines.push(color('90', viewMode === 'past'
-    ? ` q quit · p back to live · s sort (${pastSort}) · c theme (${theme}) · j/k scroll · ${pricesSource} prices`
-    : ` q quit · t grid/tree · p past · c theme (${theme}) · j/k scroll · ${pricesSource} prices · *poof* = done`));
+    ? ` q quit · p back to live · s sort (${pastSort}) · t theme · j/k scroll · ${pricesSource} prices`
+    : ` q quit · v grid/tree · p past · t theme · j/k scroll · ${pricesSource} prices · *poof* = done`));
+  overlayThemeMenu(lines, cols);
   return lines;
+}
+
+// theme picker: a small modal box drawn over the screen; moving the cursor
+// previews the theme live on the sprites behind it
+function overlayThemeMenu(lines, cols) {
+  if (themeMenu < 0) return;
+  const face = (name, f) => (THEMES[name] && THEMES[name][f]) || f;
+  const body = THEME_NAMES.map((name, i) => ({
+    sel: i === themeMenu,
+    txt: `${i === themeMenu ? ' > ' : '   '}${padEnd(name, 8)} ` +
+      `${padEnd(face(name, '(o_o)'), 9)}${padEnd(face(name, '(>_<)') + '/[=]', 13)}` +
+      `${padEnd(face(name, '(^o^)'), 9)}${face(name, '(x_x)')}`,
+  }));
+  const hint = '   ↑↓ choose · enter keep · esc cancel';
+  const inner = Math.max(hint.length, ...body.map((r) => r.txt.length)) + 2;
+  const rows = [
+    color('90', `┌─ sprite theme ${'─'.repeat(Math.max(0, inner - 16))}┐`),
+    ...body.map((r) =>
+      color('90', '│') + color(r.sel ? '1;96' : '37', padEnd(r.txt, inner)) + color('90', '│')),
+    color('90', '│' + ' '.repeat(inner) + '│'),
+    color('90', '│') + color('90', padEnd(hint, inner)) + color('90', '│'),
+    color('90', `└${'─'.repeat(inner)}┘`),
+  ];
+  const left = ' '.repeat(Math.max(1, Math.floor((cols - inner - 2) / 2)));
+  const start = Math.min(2, Math.max(0, lines.length - rows.length));
+  rows.forEach((r, i) => { lines[start + i] = left + r; });
 }
 
 function draw() {
@@ -1167,10 +1208,27 @@ function draw() {
 
 // ---------- main ----------
 function handleKey(k) {
+  if (themeMenu >= 0) { // picker is open and owns the keyboard
+    const n = THEME_NAMES.length;
+    if (k === 'j' || k === `${ESC}[B`) themeMenu = (themeMenu + 1) % n;
+    else if (k === 'k' || k === `${ESC}[A`) themeMenu = (themeMenu + n - 1) % n;
+    else if (k === '\r' || k === '\n' || k === ' ') themeMenu = -1; // keep preview
+    else if (k === ESC || k === 't' || k === 'q') { setTheme(themeBefore); themeMenu = -1; }
+    else if (k === '\x03') cleanup();
+    else return;
+    if (themeMenu >= 0) setTheme(THEME_NAMES[themeMenu]); // live preview
+    draw();
+    return;
+  }
   if (k === 'q' || k === '\x03') cleanup();
-  if (k === 't') {
+  if (k === 'v') {
     viewMode = liveView = viewMode === 'grid' ? 'tree' : 'grid';
     scrollY = 0;
+    draw();
+  }
+  if (k === 't') {
+    themeBefore = theme;
+    themeMenu = THEME_NAMES.indexOf(theme);
     draw();
   }
   if (k === 'p') {
@@ -1187,11 +1245,6 @@ function handleKey(k) {
   if (k === 's') {
     pastSort = pastSort === 'date' ? 'cost' : pastSort === 'cost' ? 'project' : 'date';
     scrollY = 0;
-    draw();
-  }
-  if (k === 'c') {
-    theme = THEME_NAMES[(THEME_NAMES.indexOf(theme) + 1) % THEME_NAMES.length];
-    anim = themedAnim(theme);
     draw();
   }
   // scrolling: vim keys, arrows, page keys, mouse wheel (SGR buttons 64/65)
