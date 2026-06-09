@@ -44,10 +44,9 @@ claude-vis --once                # print one frame and exit (no TUI)
 Keys: `t` toggles between the sprite grid and a relationship tree that nests
 each subagent under the session that spawned it; `p` switches to the
 past-sessions view (and back); `s` cycles past ordering through date, cost,
-and project (grouped by directory, with per-project session counts and cost
-totals in the group headers); `q` quits. The tree and past views scroll with `j`/`k`, the arrow keys, or the
-mouse wheel (`ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a page, `g`/`G` jump to
-top/bottom).
+and project; `q` quits. The tree and past views scroll with `j`/`k`, the
+arrow keys, or the mouse wheel (`ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a
+page, `g`/`G` jump to top/bottom).
 
 ```
  @ happy-demo-session    \(o_o)/ *   DELEGATE  Task dig into the docs  00:14
@@ -57,13 +56,33 @@ top/bottom).
 ```
 
 The past view replaces the live grid/tree and activity ticker with the most
-recent finished sessions (capped at 15), each with its end time, total cost,
-and its priciest subagents nested under it:
+recent finished sessions (capped at 15) — the same tree layout, but for your
+history: each session shows when it ended, its total cost and tokens (Σ spans
+the session plus all of its subagents), and its priciest subagents nested
+under it:
 
 ```
- @ mutable-beaming-flame  (x_x)      ENDED     ended 2h ago   Σ $136 201.2m
- ├─ engineer              (x_x)      ENDED                      $3.08 6.43m
- └─ +12 more subagents (in Σ above)
+ *  claude-vis [past]  4 past sessions · by date · $61.9 · 88.40m tok
+
+ @ brisk-juggling-comet    (x_x)  ENDED  ended 12m ago  Σ $28.4 41.20m  13:50  rocket-shop
+ ├─ engineer               (x_x)  ENDED                   $4.12  8.91m  13:42  rocket-shop
+ ├─ test-writer            (x_x)  ENDED                   $2.30  4.05m  13:47  rocket-shop
+ └─ +6 more subagents (in Σ above)
+
+ @ quiet-painting-meadow   (x_x)  ENDED  ended 3h ago   Σ $19.7 30.16m  11:04  todo-app
+ └─ researcher             (x_x)  ENDED                   $1.88  3.42m  10:58  todo-app
+```
+
+Sorting by project groups sessions by directory and rolls the cost up into
+the group headers — a quick answer to "what has each project cost me lately?":
+
+```
+ ─── rocket-shop · 3 sessions · Σ $44.6 63.71m ────────────────────────────
+ @ brisk-juggling-comet    (x_x)  ENDED  ended 12m ago  Σ $28.4 41.20m  13:50  rocket-shop
+ @ floating-mango-sunrise  (x_x)  ENDED  ended 1d ago   Σ $16.2 22.51m  Jun 8  rocket-shop
+
+ ─── todo-app · 1 session · Σ $19.7 30.16m ────────────────────────────────
+ @ quiet-painting-meadow   (x_x)  ENDED  ended 3h ago   Σ $19.7 30.16m  11:04  todo-app
 ```
 
 Past tallies are scanned lazily — one transcript per tick — so a deep history
