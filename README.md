@@ -31,11 +31,11 @@ hooks, no config, and no changes needed in the session being watched.
 ## Usage
 
 ```sh
-node index.js                       # watch everything active in the last 5 min
-node index.js --project claude-vis  # only sessions whose project path matches
-node index.js --window 15           # widen the activity window to 15 minutes
-node index.js --tree                # start in tree view
-node index.js --once                # print one frame and exit (no TUI)
+claude-vis                       # watch everything active in the last 5 min
+claude-vis --project claude-vis  # only sessions whose project path matches
+claude-vis --window 15           # widen the activity window to 15 minutes
+claude-vis --tree                # start in tree view
+claude-vis --once                # print one frame and exit (no TUI)
 ```
 
 Keys: `t` toggles between the sprite grid and a relationship tree that nests
