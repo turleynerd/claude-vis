@@ -35,6 +35,9 @@ cancel), `s` cycles past ordering (date / cost / project), `q` quits. The
 tree and past views scroll with `j`/`k`, the arrow keys, or the mouse wheel —
 `ctrl-d`/`ctrl-u` and PgDn/PgUp jump half a page, `g`/`G` jump to top/bottom.
 
+View, sort, and theme choices persist across launches (in
+`~/.config/claude-vis/config.json`); command-line flags override them.
+
 ## Tree view
 
 The tree nests each subagent under the session that spawned it, with one row
@@ -69,6 +72,12 @@ Every tally is computed from the `usage` blocks in the agent's transcript,
 deduped by request ID, with cache reads/writes priced separately. Pre-existing
 sessions are scanned in full at startup, so totals reflect the whole session,
 not just what happened since launch.
+
+Per-transcript token sums are cached in `~/.cache/claude-vis/` (validated by
+file size + mtime), so relaunching doesn't rescan your whole history — a
+transcript that grew resumes scanning where the last run stopped. Only token
+counts are cached; costs are recomputed at load, so price updates apply
+retroactively.
 
 Per-model prices are fetched at launch from [LiteLLM](https://github.com/BerriAI/litellm)'s
 community-maintained [model pricing sheet](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)

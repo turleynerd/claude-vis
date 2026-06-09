@@ -50,15 +50,43 @@ keys:
   s                  cycle past-session order: date / cost / project
   j/k, arrows, wheel scroll the tree and past views
   ctrl-d/u, PgDn/Up  scroll half a page; g jumps to top, G to bottom
-  q                  quit`);
+  q                  quit
+
+state:
+  view/sort/theme choices persist in ~/.config/claude-vis/config.json
+  (flags override); token tallies are cached in ~/.cache/claude-vis/`);
   process.exit(0);
 }
 const FILTER = argVal('--project', null);
 const ACTIVE_WINDOW_MS = parseFloat(argVal('--window', '5')) * 60_000;
 const ONCE = args.includes('--once');
-let viewMode = args.includes('--past') ? 'past' : args.includes('--tree') ? 'tree' : 'grid';
+
+// ---------- persisted preferences ----------
+const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'claude-vis');
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'claude-vis');
+const PREFS_FILE = path.join(CONFIG_DIR, 'config.json');
+const CACHE_FILE = path.join(CACHE_DIR, 'tallies.json');
+
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+const prefs = readJson(PREFS_FILE) || {};
+
+function savePrefs() {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(PREFS_FILE, JSON.stringify({ theme, view: viewMode, sort: pastSort }, null, 2) + '\n');
+  } catch { /* prefs are a nicety — keep running without them */ }
+}
+
+// explicit flags win, then saved prefs, then defaults
+let viewMode = args.includes('--past') ? 'past'
+  : args.includes('--tree') ? 'tree'
+  : ['grid', 'tree', 'past'].includes(prefs.view) ? prefs.view : 'grid';
 let liveView = viewMode === 'past' ? 'grid' : viewMode; // view to return to when leaving past
-let pastSort = ['cost', 'project'].includes(argVal('--sort', 'date')) ? argVal('--sort', 'date') : 'date';
+const sortArg = argVal('--sort', null);
+let pastSort = ['date', 'cost', 'project'].includes(sortArg) ? sortArg
+  : ['date', 'cost', 'project'].includes(prefs.sort) ? prefs.sort : 'date';
 let scrollY = 0; // tree/past list scroll offset, clamped at render time
 
 const TICK_MS = 120;          // render tick
@@ -161,7 +189,9 @@ const THEMES = {
   },
 };
 const THEME_NAMES = Object.keys(THEMES);
-let theme = THEME_NAMES.includes(argVal('--theme', 'people')) ? argVal('--theme', 'people') : 'people';
+const themeArg = argVal('--theme', null);
+let theme = THEME_NAMES.includes(themeArg) ? themeArg
+  : THEME_NAMES.includes(prefs.theme) ? prefs.theme : 'people';
 let themeMenu = -1;      // selected row while the picker is open, -1 = closed
 let themeBefore = null;  // theme to restore if the picker is cancelled
 
@@ -262,14 +292,14 @@ function rateFor(model) {
   };
 }
 
-function priceEntry(e) {
-  const p = rateFor(e.m);
-  return e.i * p.in + e.o * p.out + e.r * p.read + e.w5 * p.w5 + e.w1 * p.w1;
+function priceBucket(model, b) {
+  const p = rateFor(model);
+  return b.i * p.in + b.o * p.out + b.r * p.read + b.w5 * p.w5 + b.w1 * p.w1;
 }
 
 function usageEntry(u, model) {
   const cc = u.cache_creation;
-  const e = {
+  return {
     m: model,
     i: u.input_tokens || 0,
     o: u.output_tokens || 0,
@@ -277,9 +307,32 @@ function usageEntry(u, model) {
     w5: cc ? (cc.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0),
     w1: cc ? (cc.ephemeral_1h_input_tokens || 0) : 0,
   };
-  e.tok = e.i + e.o + e.r + e.w5 + e.w1;
-  e.cost = priceEntry(e);
-  return e;
+}
+
+// Tallies aggregate token sums per model (price-independent), so totals can
+// be repriced exactly when live prices land and cached across runs.
+function bucketFor(t, model) {
+  let b = t.byModel.get(model);
+  if (!b) t.byModel.set(model, b = { i: 0, o: 0, r: 0, w5: 0, w1: 0 });
+  return b;
+}
+
+function addToBucket(t, e, sign) {
+  const b = bucketFor(t, e.m);
+  b.i += sign * e.i;
+  b.o += sign * e.o;
+  b.r += sign * e.r;
+  b.w5 += sign * e.w5;
+  b.w1 += sign * e.w1;
+}
+
+function retotal(t) {
+  t.tok = 0;
+  t.cost = 0;
+  for (const [m, b] of t.byModel) {
+    t.tok += b.i + b.o + b.r + b.w5 + b.w1;
+    t.cost += priceBucket(m, b);
+  }
 }
 
 function fetchJson(url, timeoutMs, redirects = 3) {
@@ -325,39 +378,125 @@ async function loadLivePrices() {
   if (livePrices.size === 0) return;
   pricesSource = 'live';
   // reprice everything tallied before the fetch finished
-  for (const t of [...agents.values(), ...retainedUsage.values()]) {
-    t.tok = 0;
-    t.cost = 0;
-    for (const e of t.usageByReq.values()) {
-      e.cost = priceEntry(e);
-      t.tok += e.tok;
-      t.cost += e.cost;
-    }
+  for (const t of [...agents.values(), ...retainedUsage.values()]) retotal(t);
+  for (const p of pastSessions.values()) {
+    retotal(p);
+    for (const s of p.subs.values()) retotal(s);
   }
-  // past tallies don't keep per-request entries — rescan them at live prices
-  pastSessions.clear();
-  pastScanQueue.length = 0;
-  if (viewMode === 'past') scanPastSessions();
 }
 
 // Transcripts repeat the same usage on every line of a streamed message, so
 // tallies are keyed by requestId — later lines overwrite, never double-count.
 function addUsage(agent, obj) {
+  if (agent.skipUsage) return; // priming replay: tally already counted
   const u = obj.message && obj.message.usage;
   const key = obj.requestId || (obj.message && obj.message.id);
   if (!u || !key) return;
   const entry = usageEntry(u, obj.message.model || '');
   const prev = agent.usageByReq.get(key);
-  if (prev) { agent.tok -= prev.tok; agent.cost -= prev.cost; }
+  if (prev) addToBucket(agent, prev, -1);
   agent.usageByReq.set(key, entry);
-  agent.tok += entry.tok;
-  agent.cost += entry.cost;
+  addToBucket(agent, entry, 1);
+  retotal(agent);
+  // the dedupe map can shed old entries freely — totals live in byModel
   if (agent.usageByReq.size > 4000) {
     let drop = 1000;
     for (const k of agent.usageByReq.keys()) {
       agent.usageByReq.delete(k);
       if (--drop === 0) break;
     }
+  }
+}
+
+// ---------- tally cache ----------
+// Full-transcript scans are expensive on big histories, so per-file token
+// sums persist across runs (keyed by path, validated by size+mtime). Only
+// token counts are cached — costs are recomputed at load, so price updates
+// apply retroactively. A file that grew resumes scanning at the old size;
+// the final request's entry is kept so a message still streaming across the
+// boundary doesn't double-count.
+const tallyCache = new Map(); // transcript path -> cached tally
+let cacheDirty = false;
+{
+  const data = readJson(CACHE_FILE);
+  if (data && data.v === 1 && data.files) {
+    for (const [f, c] of Object.entries(data.files)) tallyCache.set(f, c);
+  }
+}
+
+function lastReqEntry(map) {
+  let last = null;
+  for (const kv of map) last = kv;
+  return last;
+}
+
+function storeCache(file, size, mtimeMs, t) {
+  tallyCache.set(file, {
+    size,
+    mtimeMs,
+    byModel: Object.fromEntries(t.byModel),
+    last: t.usageByReq ? lastReqEntry(t.usageByReq) : null,
+    name: t.name || '',
+    project: t.project || '',
+    cwd: t.cwd || '',
+  });
+  cacheDirty = true;
+}
+
+function applyCached(t, c) {
+  for (const [m, b] of Object.entries(c.byModel || {})) {
+    const dst = bucketFor(t, m);
+    dst.i += b.i;
+    dst.o += b.o;
+    dst.r += b.r;
+    dst.w5 += b.w5;
+    dst.w1 += b.w1;
+  }
+  if (c.last && t.usageByReq) t.usageByReq.set(c.last[0], c.last[1]);
+  if (c.name) t.name = c.name;
+  if (c.cwd) {
+    t.cwd = c.cwd;
+    if (!t.project) t.project = path.basename(c.cwd);
+  }
+  if (c.project && !t.project) t.project = c.project;
+  retotal(t);
+}
+
+// tally a transcript into target, through the cache when possible
+function tallyFile(target, file, st) {
+  const c = tallyCache.get(file);
+  if (c && c.size === st.size && c.mtimeMs === st.mtimeMs) {
+    applyCached(target, c);
+    return;
+  }
+  if (c && c.size > 0 && c.size < st.size) {
+    applyCached(target, c); // resume where the last run stopped
+    scanUsageInto(target, file, st.size, c.size);
+  } else {
+    scanUsageInto(target, file, st.size, 0);
+  }
+  storeCache(file, st.size, st.mtimeMs, target);
+}
+
+function saveCache() {
+  if (!cacheDirty) return;
+  cacheDirty = false;
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    let entries = [...tallyCache.entries()];
+    if (entries.length > 4000) { // keep the most recently active transcripts
+      entries.sort((x, y) => y[1].mtimeMs - x[1].mtimeMs);
+      entries.length = 4000;
+    }
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ v: 1, files: Object.fromEntries(entries) }));
+  } catch { /* the cache is best-effort */ }
+}
+
+// refresh cache entries for agents that are still being tailed
+function cacheLiveAgents() {
+  for (const a of agents.values()) {
+    const consumed = a.offset - Buffer.byteLength(a.buf, 'utf8');
+    if (consumed > 0) storeCache(a.file, consumed, a.mtimeMs, a);
   }
 }
 
@@ -488,12 +627,13 @@ function ensureAgent(meta) {
     phase: hashPhase(meta.file),
     editToolIds: new Set(),
     usageByReq: new Map(),
+    byModel: new Map(),
     tok: 0,
     cost: 0,
   };
   if (preexisting) {
     a.priming = true;
-    primeFromTail(a, st.size);
+    primeFromTail(a, st);
     a.priming = false;
   } else {
     logEvent(a, 'spawn', 'came to life');
@@ -502,12 +642,12 @@ function ensureAgent(meta) {
   return a;
 }
 
-// Scan a whole transcript for token/cost tallies (only parsing lines that
-// carry usage). `target` needs {usageByReq, tok, cost}; metadata fields are
-// captured when present.
-function scanUsageInto(target, file, size) {
+// Scan a transcript from `start` for token tallies (only parsing lines that
+// carry usage). `target` needs {usageByReq, byModel, tok, cost}; metadata
+// fields are captured when present.
+function scanUsageInto(target, file, size, start = 0) {
   const CHUNK = 1 << 22; // 4MB
-  let pos = 0;
+  let pos = start;
   let rem = '';
   while (pos < size) {
     const want = Math.min(CHUNK, size - pos);
@@ -540,7 +680,7 @@ const retainedUsage = new Map();
 function retainAgentUsage(a) {
   retainedUsage.set(a.file, {
     sessionId: a.sessionId,
-    usageByReq: a.usageByReq,
+    byModel: a.byModel,
     tok: a.tok,
     cost: a.cost,
   });
@@ -559,11 +699,12 @@ function sessionTotals(sessionId) {
 }
 
 // For files that existed before we started: skip history for animation, but
-// scan the whole file for tallies and read a tail chunk to recover the
+// tally the whole file (via the cache) and read a tail chunk to recover the
 // agent's name and current state.
-function primeFromTail(agent, size) {
+function primeFromTail(agent, st) {
+  const size = st.size;
   agent.offset = size;
-  scanUsageInto(agent, agent.file, size);
+  tallyFile(agent, agent.file, st);
   const TAIL = 32 * 1024;
   const start = Math.max(0, size - TAIL);
   const chunk = readChunk(agent.file, start, size - start);
@@ -572,13 +713,15 @@ function primeFromTail(agent, size) {
   // first line of the tail may be partial; drop it unless we read from 0
   if (start > 0) lines.shift();
   // replay the tail in order so derived state (current activity, in-flight
-  // edit ids) matches what live tailing would have produced; usage re-adds
-  // are idempotent (keyed by requestId)
+  // edit ids) matches what live tailing would have produced; usage is
+  // skipped — everything up to `size` is already in the tally
+  agent.skipUsage = true;
   for (const line of lines) {
     try {
       applyLine(agent, JSON.parse(line));
     } catch { /* partial or non-json line */ }
   }
+  agent.skipUsage = false;
   agent.stateSince = agent.mtimeMs;
 }
 
@@ -639,9 +782,9 @@ function scan() {
         // it, but tally its usage (however old) so session totals stay complete
         if (!agents.has(sf) && now - sst.mtimeMs > SUB_DONE_AFTER_MS) {
           if (!retainedUsage.has(sf)) {
-            const t = { usageByReq: new Map(), tok: 0, cost: 0 };
-            scanUsageInto(t, sf, sst.size);
-            retainedUsage.set(sf, { sessionId, usageByReq: t.usageByReq, tok: t.tok, cost: t.cost });
+            const t = { usageByReq: new Map(), byModel: new Map(), tok: 0, cost: 0 };
+            tallyFile(t, sf, sst);
+            retainedUsage.set(sf, { sessionId, byModel: t.byModel, tok: t.tok, cost: t.cost });
           }
           continue;
         }
@@ -659,7 +802,12 @@ const pastSessions = new Map(); // main session file -> entry
 const pastScanQueue = [];
 
 function pastTarget(file, kind, name) {
-  return { file, kind, name, project: '', cwd: '', mtimeMs: 0, tok: 0, cost: 0, scanned: false };
+  return {
+    file, kind, name,
+    project: '', cwd: '', mtimeMs: 0,
+    usageByReq: new Map(), byModel: new Map(),
+    tok: 0, cost: 0, scanned: false,
+  };
 }
 
 function scanPastSessions() {
@@ -720,20 +868,18 @@ function scanPastSessions() {
 }
 
 // tally one queued transcript per call so the render loop stays smooth
+// (cache hits are nearly free, so a cached history fills in immediately)
 function processPastScans() {
   while (pastScanQueue.length) {
     const t = pastScanQueue.shift();
     if (!pastSessions.has(t.kind === 'sub' ? t.parentFile : t.file)) continue; // pruned
     const st = safeStat(t.file);
     if (!st) { t.scanned = true; continue; }
-    const tmp = { kind: t.kind, name: t.name, project: '', cwd: '', usageByReq: new Map(), tok: 0, cost: 0 };
-    scanUsageInto(tmp, t.file, st.size);
-    t.tok = tmp.tok;
-    t.cost = tmp.cost;
-    t.name = tmp.name;
-    t.project = tmp.project;
+    const cached = tallyCache.get(t.file);
+    const hit = cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs;
+    tallyFile(t, t.file, st);
     t.scanned = true;
-    return;
+    if (!hit) return; // an actual disk scan happened — yield until next tick
   }
 }
 
@@ -867,6 +1013,8 @@ function lifecycle() {
     }
     if (a.dyingAt && now - a.dyingAt > DEATH_MS) {
       if (a.kind === 'sub') retainAgentUsage(a);
+      const consumed = a.offset - Buffer.byteLength(a.buf, 'utf8');
+      if (consumed > 0) storeCache(file, consumed, a.mtimeMs, a);
       const st = safeStat(file);
       if (st) deadFiles.set(file, st.mtimeMs);
       agents.delete(file);
@@ -1210,7 +1358,7 @@ function handleKey(k) {
     const n = THEME_NAMES.length;
     if (k === 'j' || k === `${ESC}[B`) themeMenu = (themeMenu + 1) % n;
     else if (k === 'k' || k === `${ESC}[A`) themeMenu = (themeMenu + n - 1) % n;
-    else if (k === '\r' || k === '\n' || k === ' ') themeMenu = -1; // keep preview
+    else if (k === '\r' || k === '\n' || k === ' ') { themeMenu = -1; savePrefs(); } // keep preview
     else if (k === ESC || k === 't' || k === 'q') { setTheme(themeBefore); themeMenu = -1; }
     else if (k === '\x03') cleanup();
     else return;
@@ -1222,6 +1370,7 @@ function handleKey(k) {
   if (k === 'v') {
     viewMode = liveView = viewMode === 'grid' ? 'tree' : 'grid';
     scrollY = 0;
+    savePrefs();
     draw();
   }
   if (k === 't') {
@@ -1238,11 +1387,13 @@ function handleKey(k) {
       scanPastSessions();
     }
     scrollY = 0;
+    savePrefs();
     draw();
   }
   if (k === 's') {
     pastSort = pastSort === 'date' ? 'cost' : pastSort === 'cost' ? 'project' : 'date';
     scrollY = 0;
+    savePrefs();
     draw();
   }
   // scrolling: vim keys, arrows, page keys, mouse wheel (SGR buttons 64/65)
@@ -1260,6 +1411,8 @@ function handleKey(k) {
 }
 
 function cleanup() {
+  cacheLiveAgents();
+  saveCache();
   if (!ONCE) process.stdout.write(`${ESC}[?1006l${ESC}[?1000l${ESC}[?25h${ESC}[?1049l`);
   process.exit(0);
 }
@@ -1275,6 +1428,8 @@ function main() {
     }
     lifecycle();
     console.log(buildScreen().join('\n'));
+    cacheLiveAgents();
+    saveCache();
     return;
   }
 
@@ -1303,6 +1458,7 @@ function main() {
     if (tick % PROBE_TICKS === 2) probeProcesses();    // session liveness ~5s
     if (viewMode === 'past' && tick % 17 === 9) scanPastSessions(); // refresh past list ~2s
     if (viewMode === 'past') processPastScans();       // tally one transcript per tick
+    if (tick % 250 === 7) { cacheLiveAgents(); saveCache(); } // persist tallies ~30s
     if (tick % 2 === 0) for (const a of agents.values()) ingest(a); // tail ~4/s
     lifecycle();
     draw();
