@@ -92,8 +92,17 @@ const HOOK_EVENTS = ['SessionStart', 'SessionEnd', 'Stop', 'SubagentStart', 'Sub
 let HOOK_EMIT_MODE = false;
 
 function hookCommand(event) {
-  // quote both paths so spaces in the install location survive the shell
-  return `${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)} --hook-emit ${event}`;
+  // The released/brew build is a bun-compiled standalone: claude-vis *is* the
+  // executable, so the hook invokes it directly. Passing it a script path (as
+  // we must under a plain node/bun runtime) breaks it — it launches the TUI
+  // instead of emitting. Detect the standalone by execPath not being a node/bun
+  // runtime. Quote paths so spaces in the install location survive the shell.
+  const execIsRuntime = /[\\/](node|bun)(\.exe)?$/i.test(process.execPath);
+  const compiled = typeof globalThis.Bun !== 'undefined' && !execIsRuntime;
+  const launcher = compiled
+    ? JSON.stringify(process.execPath)                                    // the standalone binary
+    : `${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)}`; // runtime + script
+  return `${launcher} --hook-emit ${event}`;
 }
 function isOurHookGroup(group) {
   return group && Array.isArray(group.hooks)
