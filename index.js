@@ -40,6 +40,9 @@ options:
                      "project" (grouped by directory)
   --theme <name>     sprite theme: people, bots, cats, owls, ghosts
   --once             render a single frame to stdout and exit (no TUI)
+  --install-hooks    register Claude Code hooks for exact liveness signals
+                     (so a long Bash/tool call no longer looks like a death)
+  --uninstall-hooks  remove those hooks again
   -v, --version      print version
   -h, --help         show this help
 
@@ -66,10 +69,98 @@ const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir
 const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'claude-vis');
 const PREFS_FILE = path.join(CONFIG_DIR, 'config.json');
 const CACHE_FILE = path.join(CACHE_DIR, 'tallies.json');
+const HOOK_EVENTS_FILE = process.env.CLAUDE_VIS_HOOK_EVENTS
+  || path.join(CACHE_DIR, 'hook-events.jsonl');
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
+
+// ---------- hook bridge (opt-in ground truth) ----------
+// `claude-vis --install-hooks` registers tiny hooks in the user's Claude Code
+// settings that shell back into `claude-vis --hook-emit <Event>`. Each call
+// appends one compact line to HOOK_EVENTS_FILE, which a running monitor tails
+// for exact lifecycle/activity instead of inferring it from transcript
+// silence (see readHookEvents/lifecycle). Without this, detection still works
+// — it just falls back to the mtime + process-probe heuristics.
+const HOOK_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json');
+// SessionEnd is the signal that matters (exact, immediate close); the rest are
+// cheap liveness heartbeats. We intentionally skip Pre/PostToolUse — they'd
+// spawn a process on *every* tool call, and we no longer need them (an agent
+// mid-tool already shows an active transcript state).
+const HOOK_EVENTS = ['SessionStart', 'SessionEnd', 'Stop', 'SubagentStart', 'SubagentStop'];
+let HOOK_EMIT_MODE = false;
+
+function hookCommand(event) {
+  // quote both paths so spaces in the install location survive the shell
+  return `${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)} --hook-emit ${event}`;
+}
+function isOurHookGroup(group) {
+  return group && Array.isArray(group.hooks)
+    && group.hooks.some((h) => h && typeof h.command === 'string' && h.command.includes('--hook-emit'));
+}
+function configureHooks(remove) {
+  let s = readJson(HOOK_SETTINGS_FILE);
+  if (!s || typeof s !== 'object' || Array.isArray(s)) s = {};
+  s.hooks = (s.hooks && typeof s.hooks === 'object') ? s.hooks : {};
+  // sweep every event already in settings (so stale claude-vis entries from an
+  // older install — e.g. Pre/PostToolUse we no longer use — get cleaned up too)
+  // plus the events we add on install
+  const events = new Set([...Object.keys(s.hooks), ...HOOK_EVENTS]);
+  const wanted = new Set(HOOK_EVENTS);
+  for (const event of events) {
+    const list = Array.isArray(s.hooks[event]) ? s.hooks[event] : [];
+    // strip prior claude-vis entries first so installs stay idempotent
+    const kept = list.filter((g) => !isOurHookGroup(g));
+    if (!remove && wanted.has(event)) kept.push({ matcher: '*', hooks: [{ type: 'command', command: hookCommand(event) }] });
+    if (kept.length) s.hooks[event] = kept;
+    else delete s.hooks[event];
+  }
+  if (Object.keys(s.hooks).length === 0) delete s.hooks;
+  try {
+    fs.mkdirSync(path.dirname(HOOK_SETTINGS_FILE), { recursive: true });
+    if (fs.existsSync(HOOK_SETTINGS_FILE)) {
+      fs.copyFileSync(HOOK_SETTINGS_FILE, `${HOOK_SETTINGS_FILE}.claude-vis.bak`); // one-step undo
+    }
+    fs.writeFileSync(HOOK_SETTINGS_FILE, JSON.stringify(s, null, 2) + '\n');
+  } catch (e) {
+    console.error(`claude-vis: could not update ${HOOK_SETTINGS_FILE}: ${e.message}`);
+    process.exit(1);
+  }
+  let removedLog = false;
+  if (remove) {
+    try { fs.rmSync(HOOK_EVENTS_FILE, { force: true }); removedLog = true; } catch { /* nothing to clean */ }
+  }
+  console.log(remove
+    ? `claude-vis: removed hooks from ${HOOK_SETTINGS_FILE}${removedLog ? `\nclaude-vis: deleted the event log ${HOOK_EVENTS_FILE}` : ''}`
+    : `claude-vis: installed hooks into ${HOOK_SETTINGS_FILE} (backup at ${path.basename(HOOK_SETTINGS_FILE)}.claude-vis.bak)
+claude-vis: new Claude Code sessions will report live activity to ${HOOK_EVENTS_FILE}`);
+}
+
+if (args.includes('--install-hooks')) { configureHooks(false); process.exit(0); }
+if (args.includes('--uninstall-hooks')) { configureHooks(true); process.exit(0); }
+if (args[0] === '--hook-emit') {
+  // invoked *by* a Claude Code hook; stdin carries the event's JSON payload
+  HOOK_EMIT_MODE = true;
+  const event = args[1] || 'unknown';
+  let raw = '';
+  const flush = () => {
+    let j = {};
+    try { j = JSON.parse(raw); } catch { /* tolerate empty / non-json stdin */ }
+    const rec = { ts: Date.now(), event, sid: j.session_id || '', tool: j.tool_name || '', cwd: j.cwd || '' };
+    try {
+      fs.mkdirSync(path.dirname(HOOK_EVENTS_FILE), { recursive: true });
+      // best-effort cap so an append-only log can't grow without bound
+      try { if (fs.statSync(HOOK_EVENTS_FILE).size > (2 << 20)) fs.truncateSync(HOOK_EVENTS_FILE); } catch { /* no file yet */ }
+      fs.appendFileSync(HOOK_EVENTS_FILE, JSON.stringify(rec) + '\n');
+    } catch { /* never block the agent on telemetry */ }
+    process.exit(0);
+  };
+  process.stdin.on('data', (d) => { raw += d; });
+  process.stdin.on('end', flush);
+  setTimeout(flush, 2000); // don't hang if stdin never closes
+}
+
 const prefs = readJson(PREFS_FILE) || {};
 
 function savePrefs() {
@@ -95,6 +186,13 @@ const SUB_DONE_AFTER_MS = 90_000;    // quiet subagent file -> done, despawn
 const MAIN_GONE_AFTER_MS = 10 * 60_000; // quiet main session -> despawn
 const DEATH_MS = 1300;        // length of the *poof* animation
 const PAST_MAX = 15;          // most recent past sessions kept in the tree view
+// states where transcript silence means "working" (a long tool call or
+// generation), not "finished" — Claude writes a line only when a block
+// completes, so an in-flight Bash leaves the file quiet. Agents in these
+// states aren't timed out on silence alone; see lifecycle().
+const ACTIVE_STATES = new Set(['thinking', 'editing', 'running', 'spawning']);
+const ACTIVE_BACKSTOP_MS = 30 * 60_000; // hard cap: clear an active-state agent
+                                        // left stranded by an abrupt end
 
 // ---------- sprite animation frames: [thought-bubble line, body line] ----------
 const ANIM = {
@@ -622,8 +720,6 @@ function ensureAgent(meta) {
     bornOrder: bornCounter++,
     preexisting,
     dyingAt: 0,
-    probeSeen: 0,
-    probeMisses: 0,
     phase: hashPhase(meta.file),
     editToolIds: new Set(),
     usageByReq: new Map(),
@@ -931,6 +1027,7 @@ function ingest(agent) {
 // root. A main session missing from two consecutive probes is closed.
 const PROBE_TICKS = 42; // ~5s at TICK_MS
 const liveProbe = { at: 0, ids: new Set(), cwds: new Set() };
+const sessionProbe = new Map(); // sessionId -> { misses, probeSeen }
 let probing = false;
 
 function execOut(cmd, cmdArgs) {
@@ -983,6 +1080,50 @@ async function probeProcesses() {
   }
 }
 
+// ---------- hook events (opt-in ground truth) ----------
+// When `claude-vis --install-hooks` is active, Claude Code appends lifecycle
+// events to HOOK_EVENTS_FILE. We tail it and track, per session, whether it
+// has ended — SessionEnd is authoritative, so a hook-driven session poofs the
+// instant it closes instead of waiting out the silence timers. We deliberately
+// don't try to infer "a tool is running" from Pre/PostToolUse: that signal is
+// per-session (it can't say *which* agent), and a rejected or failed tool
+// fires PreToolUse with no PostToolUse, so a naive in-flight counter leaks and
+// pins finished agents alive. An agent that's genuinely mid-tool already shows
+// an active transcript state (RUN/THINK/EDIT), which lifecycle() honors on its
+// own — so SessionEnd is the only hook signal we actually need.
+const HOOK_FRESH_MS = 15 * 60_000;  // ignore a stale log left by an old run
+const HOOK_END_GRACE_MS = 1500;     // let SessionEnd settle before the *poof*
+const hookSessions = new Map(); // sid -> { lastAt, ended, endedAt }
+let hookOffset = 0;
+
+function readHookEvents() {
+  const st = safeStat(HOOK_EVENTS_FILE);
+  if (!st) return;
+  if (st.size < hookOffset) hookOffset = 0; // log truncated/rotated under us
+  if (st.size > hookOffset) {
+    const chunk = readChunk(HOOK_EVENTS_FILE, hookOffset, st.size - hookOffset);
+    hookOffset = st.size;
+    const now = Date.now();
+    for (const line of (chunk || '').split('\n')) {
+      if (!line.trim()) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (!e.sid || now - (e.ts || 0) > HOOK_FRESH_MS) continue; // skip old runs
+      let h = hookSessions.get(e.sid);
+      if (!h) { h = { lastAt: 0, ended: false, endedAt: 0 }; hookSessions.set(e.sid, h); }
+      h.lastAt = Math.max(h.lastAt, e.ts || now);
+      // any event other than SessionEnd means the session is alive again
+      if (e.event === 'SessionEnd') { h.ended = true; h.endedAt = e.ts || now; }
+      else h.ended = false;
+    }
+  }
+  // forget sessions that ended (or fell silent) long ago
+  const cutoff = Date.now() - HOOK_FRESH_MS;
+  for (const [sid, h] of hookSessions) {
+    if ((h.ended && h.endedAt < cutoff) || h.lastAt < cutoff) hookSessions.delete(sid);
+  }
+}
+
 // ---------- lifecycle ----------
 function lifecycle() {
   const now = Date.now();
@@ -990,24 +1131,52 @@ function lifecycle() {
   for (const a of agents.values()) {
     if (a.kind === 'sub' && !a.dyingAt) liveSubSessions.add(a.sessionId);
   }
-  // sessions whose claude process has vanished from the process table; the
-  // probe must postdate the agent (its cwd may not be parsed yet at birth)
+  // Process probe → sessions whose claude process has vanished. Misses are
+  // tracked per *session* (not per agent): a session's subagents run inside
+  // the same process and share its id and cwd, so this protects them too —
+  // a subagent can't have died while the process running it is still listed.
+  // The probe must postdate the session (its cwd may not be parsed at birth).
   const closedSessions = new Set();
+  const seenSessions = new Set();
   for (const a of agents.values()) {
-    if (a.kind !== 'main') continue;
-    if (a.cwd && liveProbe.at > Math.max(a.born, a.probeSeen)) {
-      a.probeSeen = liveProbe.at;
-      const alive = liveProbe.ids.has(a.sessionId) || liveProbe.cwds.has(a.cwd);
-      a.probeMisses = alive ? 0 : a.probeMisses + 1;
+    if (seenSessions.has(a.sessionId)) continue;
+    seenSessions.add(a.sessionId);
+    let cwd = '';
+    let born = Infinity;
+    for (const b of agents.values()) {
+      if (b.sessionId !== a.sessionId) continue;
+      if (!cwd && b.cwd) cwd = b.cwd;
+      if (b.born < born) born = b.born;
     }
-    if (a.probeMisses >= 2) closedSessions.add(a.sessionId);
+    let p = sessionProbe.get(a.sessionId);
+    if (!p) { p = { misses: 0, probeSeen: 0 }; sessionProbe.set(a.sessionId, p); }
+    if (cwd && liveProbe.at > Math.max(born, p.probeSeen)) {
+      p.probeSeen = liveProbe.at;
+      const alive = liveProbe.ids.has(a.sessionId) || liveProbe.cwds.has(cwd);
+      p.misses = alive ? 0 : p.misses + 1;
+    }
+    if (p.misses >= 2) closedSessions.add(a.sessionId);
+  }
+  for (const sid of sessionProbe.keys()) {
+    if (!seenSessions.has(sid)) sessionProbe.delete(sid);
   }
   for (const [file, a] of agents) {
     const quiet = now - Math.max(a.mtimeMs, a.lastEventAt);
     const gone = !safeStat(file);
-    const closed = closedSessions.has(a.sessionId);
+    // "closed" — the session is really gone, not just quiet. SessionEnd (when
+    // hooks are installed) is exact and immediate; the process probe is the
+    // fallback and also catches a hard kill that never fired SessionEnd.
+    const hk = hookSessions.get(a.sessionId);
+    const endedByHook = hk && hk.ended && now - hk.endedAt > HOOK_END_GRACE_MS;
+    const closed = endedByHook || closedSessions.has(a.sessionId);
+    // an agent mid-tool or mid-generation shows an active transcript state and
+    // writes nothing until the block completes — don't time it out on silence;
+    // lean on `closed`, with a long backstop for anything an abrupt exit left
+    // stranded in an active state.
+    const active = ACTIVE_STATES.has(a.state);
     const doneAfter = a.kind === 'sub' ? SUB_DONE_AFTER_MS : MAIN_GONE_AFTER_MS;
-    if ((gone || closed || quiet > doneAfter) && !a.dyingAt) {
+    const quietDone = active ? quiet > ACTIVE_BACKSTOP_MS : quiet > doneAfter;
+    if ((gone || closed || quietDone) && !a.dyingAt) {
       a.dyingAt = now;
       logEvent(a, 'dying', closed && !gone ? 'session closed — *poof*' : 'finished — *poof*');
     }
@@ -1420,6 +1589,7 @@ function cleanup() {
 function main() {
   scan();
   for (const a of agents.values()) ingest(a);
+  readHookEvents();
 
   if (ONCE) {
     if (viewMode === 'past') {
@@ -1456,6 +1626,7 @@ function main() {
     tick++;
     if (tick % 17 === 1) scan();                       // discover new agents ~2s
     if (tick % PROBE_TICKS === 2) probeProcesses();    // session liveness ~5s
+    if (tick % 4 === 3) readHookEvents();              // tail hook events ~0.5s
     if (viewMode === 'past' && tick % 17 === 9) scanPastSessions(); // refresh past list ~2s
     if (viewMode === 'past') processPastScans();       // tally one transcript per tick
     if (tick % 250 === 7) { cacheLiveAgents(); saveCache(); } // persist tallies ~30s
@@ -1465,4 +1636,4 @@ function main() {
   }, TICK_MS);
 }
 
-main();
+if (!HOOK_EMIT_MODE) main(); // --hook-emit stays in its stdin handler and exits

@@ -27,6 +27,8 @@ claude-vis --sort cost           # order past sessions by cost instead of date
 claude-vis --sort project        # group past sessions by project directory
 claude-vis --theme cats          # sprite theme (see Themes below)
 claude-vis --once                # print one frame and exit (no TUI)
+claude-vis --install-hooks       # opt into exact liveness signals (see below)
+claude-vis --uninstall-hooks     # remove them again
 ```
 
 Keys: `v` toggles grid/tree, `p` toggles the past-sessions view, `t` opens
@@ -119,13 +121,53 @@ sprite — the animations, props, and *poof* stay the same:
 Claude Code writes session transcripts as JSONL to `~/.claude/projects/`
 (subagents get their own files under `<session-id>/subagents/`). claude-vis
 tails those files and animates each agent based on the latest event — no
-hooks, no config, and no changes needed in the session being watched.
+config and no changes needed in the session being watched (hooks are an
+optional accuracy upgrade, see below).
 
-A session *poofs* as soon as its Claude process disappears from the process
-table (closing Claude is detected within ~10s, via `--session-id`/`--resume`
-in argv or a claude binary whose cwd is the project root). Sessions whose
-process can't be identified fall back to timers: subagents despawn after 90s
-of silence, main sessions after 10 minutes.
+### Knowing when an agent is *really* gone
+
+Claude only writes a transcript line when a block finishes, so a long `Bash`
+call, a slow tool, or a big generation leaves the file silent for minutes —
+silence alone can't tell "still working" from "quit". claude-vis resolves it
+in two layers:
+
+1. **Process probe.** Every ~5s it checks the process table for the session's
+   claude process — by `--session-id`/`--resume` in argv, or a claude binary
+   whose cwd is the project root. Two consecutive misses means the session
+   closed (detected within ~10s). The check is tracked per *session*, so it
+   covers subagents too: a subagent runs inside its parent's process, so it
+   can't have died while that process is still listed.
+2. **State-aware timers.** An agent caught mid-work (thinking, editing,
+   running a tool, or waiting on its subagents) is never timed out on silence
+   alone — only a confirmed process exit ends it. Only agents at a turn
+   boundary fall back to timers: subagents despawn after 90s of quiet, main
+   sessions after 10 minutes. A long backstop clears anything an abrupt exit
+   left stranded mid-state.
+
+This is why a subagent blocked on a slow `npm test` no longer *poofs* as
+"finished" while it's actually still running.
+
+### Exact signals via hooks (optional)
+
+The above is all heuristics over transcripts and the process table — no setup
+required. If you want ground truth instead of inference, run:
+
+```sh
+claude-vis --install-hooks
+```
+
+This registers small hooks in `~/.claude/settings.json` (`SessionStart`,
+`SessionEnd`, `Stop`, `SubagentStart`, `SubagentStop`) that shell back into
+`claude-vis --hook-emit <Event>` and append one compact line to
+`~/.cache/claude-vis/hook-events.jsonl`. A running claude-vis tails that log
+and, for any session it sees there, ends it the instant `SessionEnd` fires
+instead of waiting out the silence timer — so a closed session poofs at once.
+(There are deliberately no per-tool hooks: those would spawn a process on
+every tool call, and an agent that's mid-tool already shows an active state
+on its own.) Existing settings are preserved, a `.claude-vis.bak` backup is
+written, and `--uninstall-hooks` removes only the entries claude-vis added and
+deletes the event log. The hooks take effect for *new* Claude Code sessions;
+sessions started without them keep using the probe-and-timer fallback.
 
 Set `CLAUDE_VIS_PROJECTS_DIR` to watch a directory other than
 `~/.claude/projects` (handy for demos and testing). The screenshots above are

@@ -104,7 +104,16 @@ session({
 // ---------- frame capture ----------
 function frame(args, cols) {
   return execFileSync('node', [path.join(ROOT, 'index.js'), '--once', ...args], {
-    env: { ...process.env, CLAUDE_VIS_PROJECTS_DIR: fixture, COLUMNS: String(cols) },
+    // point config/cache at the throwaway fixture so the maintainer's local
+    // prefs (theme, view, sort) can't leak into the screenshots — shots must
+    // render the defaults (people theme, date sort) deterministically
+    env: {
+      ...process.env,
+      CLAUDE_VIS_PROJECTS_DIR: fixture,
+      XDG_CONFIG_HOME: path.join(fixture, '.config'),
+      XDG_CACHE_HOME: path.join(fixture, '.cache'),
+      COLUMNS: String(cols),
+    },
     encoding: 'utf8',
   });
 }
