@@ -91,6 +91,22 @@ const HOOK_SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json');
 const HOOK_EVENTS = ['SessionStart', 'SessionEnd', 'Stop', 'SubagentStart', 'SubagentStop'];
 let HOOK_EMIT_MODE = false;
 
+// Homebrew installs into a versioned keg, `<prefix>/Cellar/<name>/<version>/…`,
+// and maintains a stable symlink, `<prefix>/opt/<name>/…`, pointing at the
+// active version — its docs recommend the "opt prefix" as the reference that
+// survives `brew upgrade`. process.execPath resolves to the volatile Cellar
+// path, so rewrite it to the opt path; a hook wired to opt keeps working after
+// upgrades without re-running --install-hooks. Non-brew installs (no /Cellar/
+// segment, or no opt symlink) fall through to execPath unchanged.
+function stableExecPath() {
+  const m = process.execPath.match(/^(.*)\/Cellar\/([^/]+)\/[^/]+\/(.+)$/);
+  if (m) {
+    const opt = `${m[1]}/opt/${m[2]}/${m[3]}`;
+    if (fs.existsSync(opt)) return opt;
+  }
+  return process.execPath;
+}
+
 function hookCommand(event) {
   // The released/brew build is a bun-compiled standalone: claude-vis *is* the
   // executable, so the hook invokes it directly. Passing it a script path (as
@@ -100,7 +116,7 @@ function hookCommand(event) {
   const execIsRuntime = /[\\/](node|bun)(\.exe)?$/i.test(process.execPath);
   const compiled = typeof globalThis.Bun !== 'undefined' && !execIsRuntime;
   const launcher = compiled
-    ? JSON.stringify(process.execPath)                                    // the standalone binary
+    ? JSON.stringify(stableExecPath())                                    // the standalone binary
     : `${JSON.stringify(process.execPath)} ${JSON.stringify(__filename)}`; // runtime + script
   return `${launcher} --hook-emit ${event}`;
 }
